@@ -3,7 +3,7 @@ use crate::models::{scan_models_dir, ModelEntry};
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tauri::{ipc::Channel, AppHandle, State};
+use tauri::{ipc::Channel, State};
 use tracing::{error, info};
 
 pub struct ModelsDir(pub PathBuf);
