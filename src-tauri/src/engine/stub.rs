@@ -1,6 +1,8 @@
 //! Stub engine – compiles everywhere, streams mock tokens.
 //! Replace with engine-llama feature for real inference.
 
+#![cfg_attr(feature = "engine-candle", allow(dead_code))]
+
 use super::{InferenceParams, LlmEngine, ModelInfo, TokenEvent};
 use anyhow::Result;
 use std::path::Path;

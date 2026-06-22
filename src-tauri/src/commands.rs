@@ -29,9 +29,12 @@ pub async fn load_model(
 ) -> Result<ModelInfo, String> {
     info!("Loading model: {}", path);
     let mut eng = engine.lock().await;
-    eng.load(&path).map_err(|e| {
-        error!("Failed to load model: {}", e);
-        e.to_string()
+    // Reading the GGUF into RAM is blocking I/O; park the async thread.
+    tokio::task::block_in_place(|| {
+        eng.load(&path).map_err(|e| {
+            error!("Failed to load model: {}", e);
+            e.to_string()
+        })
     })
 }
 
@@ -86,13 +89,17 @@ pub async fn run_inference(
         return Err("No model loaded. Select and load a model first.".to_string());
     }
 
-    eng.infer(&params, &mut |tok| {
-        channel
-            .send(StreamEvent {
-                token: tok.token,
-                done: tok.done,
-            })
-            .map_err(|e| anyhow!("channel send error: {}", e))
+    // Inference is CPU-bound and may run for many seconds; use block_in_place
+    // so the tokio runtime can continue scheduling other async work.
+    tokio::task::block_in_place(|| {
+        eng.infer(&params, &mut |tok| {
+            channel
+                .send(StreamEvent {
+                    token: tok.token,
+                    done: tok.done,
+                })
+                .map_err(|e| anyhow!("channel send error: {}", e))
+        })
     })
     .map_err(|e| e.to_string())
 }
@@ -117,8 +124,8 @@ pub async fn get_system_info(engine: State<'_, EngineHandle>) -> Result<SystemIn
     };
 
     Ok(SystemInfo {
-        backend: if cfg!(feature = "engine-llama") {
-            "llama-cpp".to_string()
+        backend: if cfg!(feature = "engine-candle") {
+            "candle-cpu".to_string()
         } else {
             "stub".to_string()
         },

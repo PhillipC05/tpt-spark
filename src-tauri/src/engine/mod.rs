@@ -1,5 +1,8 @@
 pub mod stub;
 
+#[cfg(feature = "engine-candle")]
+pub mod candle_engine;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -43,6 +46,7 @@ pub trait LlmEngine: Send + Sync {
     fn model_info(&self) -> Option<&ModelInfo>;
 
     /// Run inference, calling `on_token` for every generated token.
+    /// Implementations should handle the KV cache internally.
     fn infer(
         &self,
         params: &InferenceParams,
@@ -64,7 +68,16 @@ pub struct ModelInfo {
 pub type EngineHandle = Arc<tokio::sync::Mutex<Box<dyn LlmEngine>>>;
 
 pub fn default_engine() -> EngineHandle {
-    Arc::new(tokio::sync::Mutex::new(
-        Box::new(stub::StubEngine::new()) as Box<dyn LlmEngine>
-    ))
+    #[cfg(feature = "engine-candle")]
+    {
+        Arc::new(tokio::sync::Mutex::new(
+            Box::new(candle_engine::CandleEngine::new()) as Box<dyn LlmEngine>,
+        ))
+    }
+    #[cfg(not(feature = "engine-candle"))]
+    {
+        Arc::new(tokio::sync::Mutex::new(
+            Box::new(stub::StubEngine::new()) as Box<dyn LlmEngine>,
+        ))
+    }
 }

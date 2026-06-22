@@ -14,27 +14,38 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri          = { version = "2", features = ["tray-icon"] }
+tauri                = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell   = "2"
 tauri-plugin-dialog  = "2"
 tauri-plugin-fs      = "2"
-serde          = { version = "1", features = ["derive"] }
-serde_json     = "1"
-tokio          = { version = "1", features = ["full"] }
-anyhow         = "1"
-thiserror      = "1"
-uuid           = { version = "1", features = ["v4"] }
-chrono         = { version = "0.4", features = ["serde"] }
-dirs-next      = "2"
-tracing        = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde                = { version = "1", features = ["derive"] }
+serde_json           = "1"
+tokio                = { version = "1", features = ["full"] }
+anyhow               = "1"
+thiserror            = "1"
+uuid                 = { version = "1", features = ["v4"] }
+chrono               = { version = "0.4", features = ["serde"] }
+dirs-next            = "2"
+tracing              = "0.1"
+tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
 
-# Engine feature: stub always compiles; llama enables llama.cpp bindings
-[features]
-default = ["engine-stub"]
-engine-stub  = []
-engine-llama = ["llama-cpp-2"]
-
-[dependencies.llama-cpp-2]
-version  = "0.1"
+# Candle engine (CPU inference via HuggingFace candle + GGUF)
+[dependencies.candle-core]
+version  = "0.8"
 optional = true
+
+[dependencies.candle-transformers]
+version  = "0.8"
+optional = true
+
+[dependencies.tokenizers]
+version          = "0.21"
+optional         = true
+default-features = false
+features         = ["onig"]
+
+# Feature flags
+[features]
+default       = ["engine-stub"]
+engine-stub   = []
+engine-candle = ["candle-core", "candle-transformers", "tokenizers"]

@@ -11,15 +11,15 @@
 - [x] Word-by-word streaming display with blinking cursor
 - [x] Push initial commit to `claude/hopeful-maxwell-ytvggl`
 
-## Phase 2: Engine Integration (wgpu + candle)
-- [ ] Add `candle` (Hugging Face) as the AI math engine dependency
-- [ ] Implement `CandleEngine` struct satisfying `LlmEngine` trait
-- [ ] Parse GGUF file format and load weights via zero-copy `mmap`
-- [ ] Implement tokenizer (BPE / SentencePiece) in Rust
-- [ ] CPU inference via `candle` — prove single-binary pipeline end-to-end
+## Phase 2: Engine Integration (wgpu + candle) ✅
+- [x] Add `candle` (Hugging Face) as the AI math engine dependency
+- [x] Implement `CandleEngine` struct satisfying `LlmEngine` trait
+- [x] Parse GGUF file format and load weights via zero-copy `mmap`
+- [x] Implement tokenizer (BPE / SentencePiece) in Rust
+- [x] CPU inference via `candle` — prove single-binary pipeline end-to-end
 - [ ] Test loading a real `.gguf` model (e.g. Llama 3.2 1B or Phi-3 mini)
 - [ ] Validate streaming token output in the UI
-- [ ] Handle context length limits and truncation gracefully
+- [x] Handle context length limits and truncation gracefully
 
 ## Phase 3: GPU Acceleration (wgpu)
 - [ ] Implement `wgpu` compute shader pipeline for matrix multiply (GEMM)
