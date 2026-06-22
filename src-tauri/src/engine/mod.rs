@@ -1,0 +1,70 @@
+pub mod stub;
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// A single streamed token event sent back to the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenEvent {
+    pub token: String,
+    pub done: bool,
+}
+
+/// Parameters controlling a single inference run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceParams {
+    pub prompt: String,
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub repeat_penalty: f32,
+}
+
+impl Default for InferenceParams {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            max_tokens: 512,
+            temperature: 0.7,
+            top_p: 0.9,
+            repeat_penalty: 1.1,
+        }
+    }
+}
+
+/// Core trait that every engine backend must implement.
+pub trait LlmEngine: Send + Sync {
+    fn load(&mut self, model_path: &str) -> Result<ModelInfo>;
+    fn unload(&mut self) -> Result<()>;
+    fn is_loaded(&self) -> bool;
+    fn model_info(&self) -> Option<&ModelInfo>;
+
+    /// Run inference, calling `on_token` for every generated token.
+    fn infer(
+        &self,
+        params: &InferenceParams,
+        on_token: &mut dyn FnMut(TokenEvent) -> Result<()>,
+    ) -> Result<()>;
+}
+
+/// Metadata about a loaded model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub backend: String,
+}
+
+/// Shared, thread-safe engine handle used from Tauri state.
+pub type EngineHandle = Arc<tokio::sync::Mutex<Box<dyn LlmEngine>>>;
+
+pub fn default_engine() -> EngineHandle {
+    Arc::new(tokio::sync::Mutex::new(
+        Box::new(stub::StubEngine::new()) as Box<dyn LlmEngine>
+    ))
+}

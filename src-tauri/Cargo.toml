@@ -1,0 +1,40 @@
+[package]
+name = "tpt-spark"
+version = "0.1.0"
+description = "TPT Spark – Project Forge: Lean, native, cross-platform LLM runtime"
+authors = ["TPT Spark Contributors"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "tpt_spark_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri          = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell   = "2"
+tauri-plugin-dialog  = "2"
+tauri-plugin-fs      = "2"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+tokio          = { version = "1", features = ["full"] }
+anyhow         = "1"
+thiserror      = "1"
+uuid           = { version = "1", features = ["v4"] }
+chrono         = { version = "0.4", features = ["serde"] }
+dirs-next      = "2"
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Engine feature: stub always compiles; llama enables llama.cpp bindings
+[features]
+default = ["engine-stub"]
+engine-stub  = []
+engine-llama = ["llama-cpp-2"]
+
+[dependencies.llama-cpp-2]
+version  = "0.1"
+optional = true

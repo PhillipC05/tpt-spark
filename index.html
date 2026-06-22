@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TPT Spark</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="app">
+      <!-- Sidebar -->
+      <aside id="sidebar">
+        <div class="sidebar-header">
+          <div class="logo">
+            <span class="logo-icon">⚡</span>
+            <span class="logo-text">TPT <strong>Spark</strong></span>
+          </div>
+          <div class="tagline">Project Forge</div>
+        </div>
+
+        <!-- Model selector -->
+        <section class="sidebar-section">
+          <div class="section-label">Model</div>
+          <div id="model-status" class="model-status not-loaded">
+            <span class="status-dot"></span>
+            <span id="model-status-text">No model loaded</span>
+          </div>
+          <select id="model-select" class="model-select" disabled>
+            <option value="">Scanning for models…</option>
+          </select>
+          <div class="model-actions">
+            <button id="btn-load" class="btn btn-primary" disabled>Load</button>
+            <button id="btn-unload" class="btn btn-ghost" disabled>Unload</button>
+          </div>
+          <div id="model-meta" class="model-meta hidden"></div>
+        </section>
+
+        <!-- Model directory info -->
+        <section class="sidebar-section">
+          <div class="section-label">Models directory</div>
+          <div id="models-dir" class="models-dir-path">…</div>
+          <p class="hint">Drop <code>.gguf</code> files here, then click Refresh.</p>
+          <button id="btn-refresh" class="btn btn-ghost btn-sm">⟳ Refresh</button>
+        </section>
+
+        <!-- Inference settings -->
+        <section class="sidebar-section">
+          <div class="section-label">Generation</div>
+          <label class="param-label">
+            Max tokens
+            <input id="param-max-tokens" type="number" min="64" max="4096" value="512" class="param-input" />
+          </label>
+          <label class="param-label">
+            Temperature <span id="temp-val">0.7</span>
+            <input id="param-temperature" type="range" min="0" max="2" step="0.05" value="0.7" class="param-slider" />
+          </label>
+          <label class="param-label">
+            Top-P <span id="topp-val">0.9</span>
+            <input id="param-top-p" type="range" min="0" max="1" step="0.05" value="0.9" class="param-slider" />
+          </label>
+          <label class="param-label">
+            Repeat penalty <span id="rep-val">1.1</span>
+            <input id="param-repeat-penalty" type="range" min="1" max="2" step="0.05" value="1.1" class="param-slider" />
+          </label>
+        </section>
+
+        <div class="sidebar-footer">
+          <div id="backend-badge" class="backend-badge">backend: stub</div>
+        </div>
+      </aside>
+
+      <!-- Main chat area -->
+      <main id="chat-area">
+        <div id="messages" class="messages">
+          <div class="welcome-screen" id="welcome-screen">
+            <div class="welcome-icon">⚡</div>
+            <h1 class="welcome-title">TPT Spark</h1>
+            <p class="welcome-sub">
+              A lean, native LLM runtime. No daemons. No HTTP overhead.<br />
+              Load a <code>.gguf</code> model from the sidebar to get started.
+            </p>
+            <div class="welcome-features">
+              <div class="feature-chip">🦀 Rust + Tauri v2</div>
+              <div class="feature-chip">🎮 wgpu / Vulkan / Metal</div>
+              <div class="feature-chip">⚡ Zero-copy mmap</div>
+              <div class="feature-chip">🔒 Fully local</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Input bar -->
+        <div id="input-bar" class="input-bar">
+          <div class="input-wrapper">
+            <textarea
+              id="prompt-input"
+              class="prompt-input"
+              placeholder="Send a message… (Enter to send, Shift+Enter for newline)"
+              rows="1"
+              disabled
+            ></textarea>
+            <button id="btn-send" class="btn btn-send" disabled>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
+          </div>
+          <div id="status-bar" class="status-bar"></div>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>
