@@ -124,7 +124,9 @@ pub async fn get_system_info(engine: State<'_, EngineHandle>) -> Result<SystemIn
     };
 
     Ok(SystemInfo {
-        backend: if cfg!(feature = "engine-candle") {
+        backend: if cfg!(feature = "engine-wgpu") {
+            "wgpu".to_string()
+        } else if cfg!(feature = "engine-candle") {
             "candle-cpu".to_string()
         } else {
             "stub".to_string()

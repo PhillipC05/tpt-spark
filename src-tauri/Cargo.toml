@@ -44,8 +44,33 @@ optional         = true
 default-features = false
 features         = ["onig"]
 
+# wgpu engine (GPU inference via wgpu + custom WGSL shaders)
+[dependencies.wgpu]
+version  = "0.20"
+optional = true
+
+[dependencies.bytemuck]
+version  = "1"
+optional = true
+features = ["derive"]
+
+[dependencies.memmap2]
+version  = "0.9"
+optional = true
+
+[dependencies.half]
+version  = "2"
+optional = true
+
+[dependencies.pollster]
+version  = "0.3"
+optional = true
+
 # Feature flags
 [features]
 default       = ["engine-stub"]
 engine-stub   = []
 engine-candle = ["candle-core", "candle-transformers", "tokenizers"]
+# engine-wgpu unions candle deps so the CPU fallback path is always available
+engine-wgpu   = ["wgpu", "bytemuck", "memmap2", "half", "pollster",
+                  "candle-core", "candle-transformers", "tokenizers"]

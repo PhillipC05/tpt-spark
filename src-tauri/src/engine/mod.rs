@@ -3,6 +3,19 @@ pub mod stub;
 #[cfg(feature = "engine-candle")]
 pub mod candle_engine;
 
+#[cfg(feature = "engine-wgpu")]
+pub mod wgpu_context;
+#[cfg(feature = "engine-wgpu")]
+pub mod wgpu_loader;
+#[cfg(feature = "engine-wgpu")]
+pub mod wgpu_kvcache;
+#[cfg(feature = "engine-wgpu")]
+pub mod wgpu_ops;
+#[cfg(feature = "engine-wgpu")]
+pub mod wgpu_engine;
+#[cfg(feature = "engine-wgpu")]
+pub mod cpu_fallback;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -68,13 +81,19 @@ pub struct ModelInfo {
 pub type EngineHandle = Arc<tokio::sync::Mutex<Box<dyn LlmEngine>>>;
 
 pub fn default_engine() -> EngineHandle {
-    #[cfg(feature = "engine-candle")]
+    #[cfg(feature = "engine-wgpu")]
+    {
+        Arc::new(tokio::sync::Mutex::new(
+            Box::new(wgpu_engine::WgpuEngine::new()) as Box<dyn LlmEngine>,
+        ))
+    }
+    #[cfg(all(feature = "engine-candle", not(feature = "engine-wgpu")))]
     {
         Arc::new(tokio::sync::Mutex::new(
             Box::new(candle_engine::CandleEngine::new()) as Box<dyn LlmEngine>,
         ))
     }
-    #[cfg(not(feature = "engine-candle"))]
+    #[cfg(not(any(feature = "engine-candle", feature = "engine-wgpu")))]
     {
         Arc::new(tokio::sync::Mutex::new(
             Box::new(stub::StubEngine::new()) as Box<dyn LlmEngine>,
