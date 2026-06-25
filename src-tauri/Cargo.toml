@@ -1,8 +1,9 @@
 [package]
 name = "tpt-spark"
-version = "0.1.0"
+version = "1.0.0"
 description = "TPT Spark – Project Forge: Lean, native, cross-platform LLM runtime"
-authors = ["TPT Spark Contributors"]
+authors = ["TPT Solutions"]
+license = "Apache-2.0"
 edition = "2021"
 rust-version = "1.77"
 
@@ -28,6 +29,8 @@ chrono               = { version = "0.4", features = ["serde"] }
 dirs-next            = "2"
 tracing              = "0.1"
 tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
+reqwest              = { version = "0.12", features = ["stream"] }
+futures-util         = "0.3"
 
 # Candle engine (CPU inference via HuggingFace candle + GGUF)
 [dependencies.candle-core]

@@ -108,7 +108,10 @@ body {
 .btn-primary:not(:disabled):hover { background: var(--accent-hover); }
 .btn-ghost { background: var(--bg-3); color: var(--text-1); border: 1px solid var(--border); }
 .btn-ghost:not(:disabled):hover { background: var(--bg-hover); color: var(--text-0); }
+.btn-danger { background: rgba(245,115,106,0.15); color: var(--red); border: 1px solid var(--red); }
+.btn-danger:not(:disabled):hover { background: rgba(245,115,106,0.25); }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
+.btn-xs { padding: 2px 7px; font-size: 11px; }
 
 /* ── Chat area ────────────────────────────────────────────────────────────── */
 #chat-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-0); }
@@ -125,7 +128,7 @@ body {
 .feature-chip { background: var(--bg-2); border: 1px solid var(--border); border-radius: 20px; padding: 5px 14px; font-size: 12px; color: var(--text-1); }
 
 /* ── Messages ─────────────────────────────────────────────────────────────── */
-.message { display: flex; gap: 12px; padding: 8px 24px; max-width: 900px; margin: 0 auto; width: 100%; animation: fadein 0.2s ease; }
+.message { display: flex; gap: 12px; padding: 8px 24px; max-width: 900px; margin: 0 auto; width: 100%; animation: fadein 0.2s ease; position: relative; }
 @keyframes fadein { from { opacity: 0; transform: translateY(6px); } to { opacity:1; transform:none; } }
 .message.user { flex-direction: row-reverse; }
 
@@ -137,6 +140,10 @@ body {
 .message.user .message-bubble { background: var(--accent-dim); border-color: var(--accent-dim); }
 .message-bubble.streaming::after { content: "▋"; animation: blink 0.8s infinite; color: var(--accent); }
 @keyframes blink { 0%,100%{ opacity:1 } 50%{ opacity:0 } }
+
+.copy-btn { position: absolute; top: 10px; right: 28px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-2); cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0; padding: 4px; transition: opacity 0.15s, color 0.15s; }
+.message.assistant:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { color: var(--text-0); }
 
 .message-error { max-width: 900px; margin: 4px auto; padding: 4px 24px; width: 100%; }
 .error-bubble { background: rgba(245,115,106,0.1); border: 1px solid var(--red); border-radius: var(--radius-sm); padding: 8px 12px; color: var(--red); font-size: 13px; }
@@ -153,7 +160,43 @@ body {
 .btn-send { background: var(--accent); color: #fff; border-radius: var(--radius); padding: 10px 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .btn-send:not(:disabled):hover { background: var(--accent-hover); }
 
+.btn-stop { background: rgba(245,115,106,0.15); color: var(--red); border: 1px solid var(--red); border-radius: var(--radius); padding: 10px 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.btn-stop:hover { background: rgba(245,115,106,0.28); }
+
 .status-bar { max-width: 900px; margin: 6px auto 0; font-size: 11px; color: var(--text-2); min-height: 16px; }
+
+/* ── Section label row (label + icon button) ─────────────────────────────── */
+.section-label-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.section-label-row .section-label { margin-bottom: 0; }
+
+/* ── Conversation list ────────────────────────────────────────────────────── */
+.conv-list { display: flex; flex-direction: column; gap: 2px; max-height: 180px; overflow-y: auto; }
+.conv-empty { font-size: 12px; color: var(--text-2); text-align: center; padding: 8px 0; }
+.conv-item { display: flex; align-items: center; gap: 4px; padding: 5px 6px; border-radius: var(--radius-sm); cursor: pointer; transition: background 0.12s; }
+.conv-item:hover { background: var(--bg-hover); }
+.conv-title { flex: 1; font-size: 12px; color: var(--text-0); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-model { font-size: 10px; color: var(--text-2); white-space: nowrap; }
+.conv-delete { opacity: 0; flex-shrink: 0; }
+.conv-item:hover .conv-delete { opacity: 1; }
+
+/* ── System prompt ────────────────────────────────────────────────────────── */
+.sysprompt-panel { margin-top: 4px; }
+.system-prompt-input { width: 100%; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-0); font-family: var(--font-sans); font-size: 12px; line-height: 1.5; padding: 7px 9px; resize: vertical; transition: border-color 0.15s; }
+.system-prompt-input:focus { outline: none; border-color: var(--accent); }
+.system-prompt-input::placeholder { color: var(--text-2); }
+
+/* ── Download panel ───────────────────────────────────────────────────────── */
+.download-panel { margin-top: 4px; display: flex; flex-direction: column; gap: 4px; }
+.dl-progress-wrap { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.dl-progress { flex: 1; accent-color: var(--accent); height: 6px; }
+.dl-progress-txt { font-size: 11px; color: var(--text-1); min-width: 36px; text-align: right; }
+
+/* ── Confirm dialog ───────────────────────────────────────────────────────── */
+.confirm-dialog { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-0); padding: 0; width: 360px; max-width: 90vw; }
+.confirm-dialog::backdrop { background: rgba(0,0,0,0.6); }
+.confirm-content { padding: 20px 24px; }
+.confirm-content p { margin-bottom: 16px; font-size: 14px; line-height: 1.5; }
+.confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
 /* ── Scrollbar ────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 6px; }

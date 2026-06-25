@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use tracing::info;
-use wgpu::{Adapter, Device, DeviceDescriptor, Features, Limits, Queue};
+use wgpu::{Device, DeviceDescriptor, Features, Limits, Queue};
 
 pub struct GpuContext {
     pub device: Device,
@@ -69,7 +69,6 @@ impl GpuContext {
                     label: Some("tpt-spark"),
                     required_features,
                     required_limits: Limits::default(),
-                    memory_hints: Default::default(),
                 },
                 None,
             )

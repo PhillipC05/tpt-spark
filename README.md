@@ -1,104 +1,124 @@
-# TPT Spark — Project Forge
+# ⚡ TPT Spark — Project Forge
 
-> A lean, native, cross-platform LLM runtime. No daemons. No HTTP overhead. No proprietary AI drivers.
+A lean, native, cross-platform LLM runtime. No daemons. No HTTP overhead. No Python.
 
-**TPT Spark** is an open-source desktop application for running Large Language Models locally.
-It compiles to a **single binary** and runs on Windows, macOS, and Linux using standard display
-drivers via `wgpu` — no CUDA or ROCm required.
+Load a `.gguf` model and start chatting — everything runs in a single binary, fully on-device.
+
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
+---
+
+## Features
+
+- **GPU inference** via [wgpu](https://wgpu.rs/) (Vulkan / Metal / DirectX 12) with custom WGSL compute shaders
+- **CPU fallback** via [HuggingFace candle](https://github.com/huggingface/candle) when no GPU adapter is found
+- **Zero-copy mmap** — model weights stream from disk directly into VRAM; no RAM copy
+- **Real-time token streaming** — tokens appear word-by-word as they are generated
+- **Stop generation** — cancel an in-flight inference at any time
+- **Conversation history** — sessions persist to disk as JSON and can be resumed
+- **System prompt / persona** — configurable per conversation
+- **In-app model download** — fetch GGUF files directly from any HTTPS URL
+- **Fully local** — no telemetry, no cloud, no network required after download
+- Single binary built with **Rust + Tauri v2** — ~10 MB app overhead
+
+---
+
+## Supported model architectures
+
+`llama` and `mistral` GGUF files (quantized or full precision). Tested with:
+
+- LLaMA 3 (1B, 3B, 8B)
+- Mistral 7B
+- Phi-3 Mini
+
+---
+
+## Quick start
+
+### 1. Prerequisites
+
+| Requirement | Version |
+|---|---|
+| [Rust](https://rustup.rs/) | 1.77+ |
+| [Node.js](https://nodejs.org/) | 20+ |
+| Platform libs | [Tauri prerequisites](https://tauri.app/start/prerequisites/) |
+
+### 2. Build
+
+```bash
+git clone https://github.com/tpt-solutions/tpt-spark
+cd tpt-spark
+npm install
+
+# Dev mode — hot-reload frontend + Rust watch
+npm run tauri dev
+
+# Release binary — stub engine (UI smoke-test, no AI)
+npm run tauri build
+
+# Release binary — wgpu GPU engine (recommended for real inference)
+npm run tauri build -- --features engine-wgpu
+```
+
+### 3. Add a model
+
+Place a `.gguf` file **and its matching `tokenizer.json`** in the models directory:
+
+| OS | Path |
+|---|---|
+| Windows | `%LOCALAPPDATA%\tpt-spark\models\` |
+| macOS | `~/Library/Application Support/tpt-spark/models/` |
+| Linux | `~/.local/share/tpt-spark/models/` |
+
+Or use the **Download Model** panel in the app sidebar to fetch a GGUF directly by HTTPS URL.
+
+> **Note**: `tokenizer.json` must sit next to the `.gguf` file. Download it from the same HuggingFace model repository.
+
+### 4. Chat
+
+1. Open the app, select your model from the sidebar dropdown, click **Load**.
+2. Weights upload to VRAM (GPU path) or RAM (CPU fallback) — a few seconds for a 4B model.
+3. Type a message and press **Enter** to start chatting.
+4. Click **Stop** to cancel generation at any time.
+
+---
+
+## Engine feature flags
+
+| Cargo feature | Engine | Notes |
+|---|---|---|
+| `engine-stub` *(default)* | `StubEngine` | Echoes mock tokens — compiles everywhere, no native deps |
+| `engine-candle` | `CandleEngine` | Real GGUF CPU inference via HuggingFace candle |
+| `engine-wgpu` | `WgpuEngine` | GPU inference via wgpu + WGSL shaders; falls back to candle if no GPU |
 
 ---
 
 ## Architecture
 
-| Layer | Technology | Purpose |
-|---|---|---|
-| UI / Frontend | TypeScript + Vite | Chat interface rendered by OS WebView (WebView2 / WebKit) |
-| App Core / Bridge | Rust + Tauri v2 | Window management, OS integration, IPC |
-| Async Runtime | Tokio | Non-blocking, zero-copy weight streaming |
-| Compute Backend | `wgpu` / Vulkan / Metal / DirectX 12 | GPU dispatch without CUDA |
-| AI Math Engine | `llama-cpp-rs` (V1) / `candle` (V2) | Optimized GGUF inference |
-
-### Data Flow
-
 ```
-User prompt → Tauri IPC → Rust tokenizer → wgpu GPUBuffer
-    → Vulkan / Metal compute shaders → predicted token
-    → IPC stream → TS frontend (word-by-word)
+Frontend (TypeScript + Vite)
+    ↕  Tauri IPC (Channel — zero-copy token streaming)
+Backend (Rust)
+    ├── engine/mod.rs         LlmEngine trait + EngineHandle (Arc<Mutex<...>>)
+    ├── engine/wgpu_engine    GPU path: mmap → VRAM → WGSL kernels
+    ├── engine/candle_engine  CPU path: HuggingFace candle GGUF
+    ├── engine/stub           Mock echo (default)
+    ├── engine/shaders/       WGSL: gemm, attention, rope, rms_norm, silu, dequant
+    ├── commands.rs           Tauri IPC commands
+    ├── conversation.rs       History persistence (JSON files)
+    └── models/               GGUF directory scanner
 ```
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- [Rust](https://rustup.rs/) 1.77+
-- [Node.js](https://nodejs.org/) 18+
-- Platform system libs:
-  - **Linux**: `libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev`
-  - **macOS**: Xcode Command Line Tools
-  - **Windows**: WebView2 (ships with Windows 11)
-
-### Run in development
-
-```bash
-npm install
-npm run tauri dev
-```
-
-### Build a release binary
-
-```bash
-npm run tauri build
-```
-
-The output binary lives in `src-tauri/target/release/bundle/`.
-
----
-
-## Adding Models
-
-1. Open the app and note the **Models directory** shown in the sidebar.
-2. Copy any `.gguf` model file into that directory.
-3. Click **⟳ Refresh** in the sidebar.
-4. Select the model and click **Load**.
-
-Popular GGUF sources: [HuggingFace](https://huggingface.co/models?library=gguf)
-
----
-
-## Engine Backends
-
-| Feature flag | Backend | Status |
-|---|---|---|
-| `engine-stub` *(default)* | Mock streaming | Compiles everywhere, no native deps |
-| `engine-llama` | llama.cpp via `llama-cpp-2` | Full GGUF inference |
-
-Enable real inference:
-
-```bash
-npm run tauri build -- --features engine-llama
-```
-
-> Requires `cmake` and a C++ compiler for the llama.cpp native build.
-
----
-
-## Roadmap
-
-- [x] Phase 1 — Foundation: Tauri v2 project, Rust backend, IPC streaming
-- [ ] Phase 2 — Engine Integration: llama-cpp-rs CPU inference
-- [ ] Phase 3 — GPU Acceleration: wgpu Vulkan / Metal dispatch, VRAM management
-- [ ] Phase 4 — Polish: model download manager, bundle size optimisation, v1.0 release
 
 ---
 
 ## Why not Ollama?
 
-Ollama wraps llama.cpp in a **Go HTTP server + daemon**. TPT Spark wraps it directly in Rust,
-stripping out the network stack, daemon process, and ~100 MB RAM overhead while keeping the same
-GGUF model support and CPU/GPU inference speed.
+Ollama wraps llama.cpp in a **Go HTTP daemon**. TPT Spark replaces the HTTP layer with Tauri IPC
+and the Go daemon with a Rust process — cutting ~100 MB RAM overhead and the requirement for a
+running background service while keeping the same GGUF model support.
+
+---
 
 ## License
 
-MIT
+[Apache 2.0](LICENSE) — © 2024 TPT Solutions

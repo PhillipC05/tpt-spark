@@ -1,12 +1,22 @@
+use crate::conversation::{
+    delete_conversation, list_conversations, load_conversation, save_conversation, Conversation,
+};
 use crate::engine::{EngineHandle, InferenceParams, ModelInfo};
 use crate::models::{scan_models_dir, ModelEntry};
 use anyhow::anyhow;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::{ipc::Channel, State};
 use tracing::{error, info};
 
+pub struct CancelFlag(pub Arc<AtomicBool>);
+
 pub struct ModelsDir(pub PathBuf);
+pub struct HistoryDir(pub PathBuf);
 
 // ── Model management ────────────────────────────────────────────────────────
 
@@ -29,7 +39,6 @@ pub async fn load_model(
 ) -> Result<ModelInfo, String> {
     info!("Loading model: {}", path);
     let mut eng = engine.lock().await;
-    // Reading the GGUF into RAM is blocking I/O; park the async thread.
     tokio::task::block_in_place(|| {
         eng.load(&path).map_err(|e| {
             error!("Failed to load model: {}", e);
@@ -53,9 +62,105 @@ pub async fn get_loaded_model(
     Ok(eng.model_info().cloned())
 }
 
+#[tauri::command]
+pub async fn delete_model(
+    path: String,
+    engine: State<'_, EngineHandle>,
+    models_dir: State<'_, ModelsDir>,
+) -> Result<(), String> {
+    let canonical = fs::canonicalize(&path)
+        .map_err(|e| format!("invalid path: {e}"))?;
+    let models_canonical = fs::canonicalize(&models_dir.0)
+        .map_err(|e| format!("models dir error: {e}"))?;
+    if !canonical.starts_with(&models_canonical) {
+        return Err("path is outside the models directory".into());
+    }
+
+    // If this model is currently loaded, unload it first.
+    {
+        let eng = engine.lock().await;
+        if eng.model_info().map(|i| i.path.as_str()) == Some(&path) {
+            drop(eng);
+            let mut eng = engine.lock().await;
+            eng.unload().map_err(|e| e.to_string())?;
+        }
+    }
+    info!("Deleting model file: {}", path);
+    fs::remove_file(&canonical).map_err(|e| format!("delete_model: {e}"))?;
+    Ok(())
+}
+
+// ── Model download ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub done: bool,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn download_model(
+    url: String,
+    filename: String,
+    channel: Channel<DownloadProgress>,
+    models_dir: State<'_, ModelsDir>,
+) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("only HTTPS URLs are allowed".into());
+    }
+    let safe_name = Path::new(&filename)
+        .file_name()
+        .ok_or_else(|| "invalid filename".to_string())?
+        .to_str()
+        .ok_or_else(|| "filename is not valid UTF-8".to_string())?
+        .to_owned();
+    let dest = models_dir.0.join(&safe_name);
+
+    info!("Downloading model from {} → {}", url, dest.display());
+
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("download request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("server returned {}", resp.status()));
+    }
+
+    let total = resp.content_length();
+    let mut stream = resp.bytes_stream();
+
+    // Create/truncate destination file.
+    let mut file = tokio::fs::File::create(&dest)
+        .await
+        .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+
+    let mut downloaded: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .map_err(|e| format!("write error: {e}"))?;
+        downloaded += chunk.len() as u64;
+
+        channel
+            .send(DownloadProgress { downloaded, total, done: false, error: None })
+            .map_err(|e| format!("channel: {e}"))?;
+    }
+
+    channel
+        .send(DownloadProgress { downloaded, total, done: true, error: None })
+        .map_err(|e| format!("channel: {e}"))?;
+
+    info!("Download complete: {} bytes → {}", downloaded, dest.display());
+    Ok(())
+}
+
 // ── Inference ────────────────────────────────────────────────────────────────
 
-/// Streamed token payload sent through the Tauri Channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamEvent {
@@ -66,17 +171,28 @@ pub struct StreamEvent {
 #[tauri::command]
 pub async fn run_inference(
     prompt: String,
+    system_prompt: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     repeat_penalty: Option<f32>,
     channel: Channel<StreamEvent>,
     engine: State<'_, EngineHandle>,
+    cancel: State<'_, CancelFlag>,
 ) -> Result<(), String> {
-    info!("Starting inference, prompt length={}", prompt.len());
+    cancel.0.store(false, Ordering::Relaxed);
+
+    // Prepend system prompt when provided.
+    let full_prompt = match &system_prompt {
+        Some(sp) if !sp.trim().is_empty() => format!("{}\n\n{}", sp.trim(), prompt),
+        _ => prompt,
+    };
+
+    info!("Starting inference, prompt_len={}", full_prompt.len());
 
     let params = InferenceParams {
-        prompt,
+        prompt: full_prompt,
+        system_prompt,
         max_tokens: max_tokens.unwrap_or(512),
         temperature: temperature.unwrap_or(0.7),
         top_p: top_p.unwrap_or(0.9),
@@ -89,19 +205,62 @@ pub async fn run_inference(
         return Err("No model loaded. Select and load a model first.".to_string());
     }
 
-    // Inference is CPU-bound and may run for many seconds; use block_in_place
-    // so the tokio runtime can continue scheduling other async work.
-    tokio::task::block_in_place(|| {
+    let cancel_flag = Arc::clone(&cancel.0);
+    let result = tokio::task::block_in_place(|| {
         eng.infer(&params, &mut |tok| {
+            if cancel_flag.load(Ordering::Relaxed) {
+                anyhow::bail!("inference cancelled");
+            }
             channel
-                .send(StreamEvent {
-                    token: tok.token,
-                    done: tok.done,
-                })
+                .send(StreamEvent { token: tok.token, done: tok.done })
                 .map_err(|e| anyhow!("channel send error: {}", e))
         })
-    })
-    .map_err(|e| e.to_string())
+    });
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().contains("inference cancelled") => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_inference(cancel: State<'_, CancelFlag>) -> Result<(), String> {
+    cancel.0.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+// ── Conversation history ─────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn save_conv(
+    conversation: Conversation,
+    history_dir: State<'_, HistoryDir>,
+) -> Result<(), String> {
+    save_conversation(&history_dir.0, &conversation).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_convs(
+    history_dir: State<'_, HistoryDir>,
+) -> Result<Vec<Conversation>, String> {
+    list_conversations(&history_dir.0).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn load_conv(
+    id: String,
+    history_dir: State<'_, HistoryDir>,
+) -> Result<Conversation, String> {
+    load_conversation(&history_dir.0, &id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_conv(
+    id: String,
+    history_dir: State<'_, HistoryDir>,
+) -> Result<(), String> {
+    delete_conversation(&history_dir.0, &id).map_err(|e| e.to_string())
 }
 
 // ── System info ──────────────────────────────────────────────────────────────

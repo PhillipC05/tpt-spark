@@ -9,7 +9,7 @@
   </head>
   <body>
     <div id="app">
-      <!-- Sidebar -->
+      <!-- Left sidebar -->
       <aside id="sidebar">
         <div class="sidebar-header">
           <div class="logo">
@@ -18,6 +18,17 @@
           </div>
           <div class="tagline">Project Forge</div>
         </div>
+
+        <!-- Conversation history -->
+        <section class="sidebar-section">
+          <div class="section-label-row">
+            <span class="section-label">Conversations</span>
+            <button id="btn-new-conv" class="btn btn-ghost btn-xs" title="New conversation">+</button>
+          </div>
+          <div id="conv-list" class="conv-list">
+            <div class="conv-empty">No saved conversations</div>
+          </div>
+        </section>
 
         <!-- Model selector -->
         <section class="sidebar-section">
@@ -30,21 +41,39 @@
             <option value="">Scanning for models…</option>
           </select>
           <div class="model-actions">
-            <button id="btn-load" class="btn btn-primary" disabled>Load</button>
-            <button id="btn-unload" class="btn btn-ghost" disabled>Unload</button>
+            <button id="btn-load"   class="btn btn-primary btn-sm" disabled>Load</button>
+            <button id="btn-unload" class="btn btn-ghost btn-sm"   disabled>Unload</button>
+            <button id="btn-delete-model" class="btn btn-danger btn-sm" disabled title="Delete selected model from disk">Delete</button>
+            <button id="btn-refresh" class="btn btn-ghost btn-sm" title="Refresh model list">⟳</button>
           </div>
           <div id="model-meta" class="model-meta hidden"></div>
         </section>
 
-        <!-- Model directory info -->
+        <!-- Download a model -->
+        <section class="sidebar-section">
+          <div class="section-label-row">
+            <span class="section-label">Download Model</span>
+            <button id="btn-toggle-download" class="btn btn-ghost btn-xs">▸</button>
+          </div>
+          <div id="download-panel" class="download-panel hidden">
+            <input id="dl-url"      class="param-input" type="url"  placeholder="Direct .gguf download URL" />
+            <input id="dl-filename" class="param-input" type="text" placeholder="Filename (e.g. model-q4.gguf)" style="margin-top:6px" />
+            <button id="btn-download" class="btn btn-primary btn-sm" style="margin-top:6px;width:100%">Download</button>
+            <div id="dl-progress-wrap" class="dl-progress-wrap hidden">
+              <progress id="dl-progress" class="dl-progress" value="0" max="100"></progress>
+              <span id="dl-progress-txt" class="dl-progress-txt">0%</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Models directory info -->
         <section class="sidebar-section">
           <div class="section-label">Models directory</div>
           <div id="models-dir" class="models-dir-path">…</div>
-          <p class="hint">Drop <code>.gguf</code> files here, then click Refresh.</p>
-          <button id="btn-refresh" class="btn btn-ghost btn-sm">⟳ Refresh</button>
+          <p class="hint">Drop <code>.gguf</code> + <code>tokenizer.json</code> files here.</p>
         </section>
 
-        <!-- Inference settings -->
+        <!-- Generation params -->
         <section class="sidebar-section">
           <div class="section-label">Generation</div>
           <label class="param-label">
@@ -63,6 +92,22 @@
             Repeat penalty <span id="rep-val">1.1</span>
             <input id="param-repeat-penalty" type="range" min="1" max="2" step="0.05" value="1.1" class="param-slider" />
           </label>
+        </section>
+
+        <!-- System prompt -->
+        <section class="sidebar-section">
+          <div class="section-label-row">
+            <span class="section-label">System Prompt</span>
+            <button id="btn-toggle-sysprompt" class="btn btn-ghost btn-xs">▸</button>
+          </div>
+          <div id="sysprompt-panel" class="sysprompt-panel hidden">
+            <textarea
+              id="system-prompt"
+              class="system-prompt-input"
+              placeholder="You are a helpful assistant…"
+              rows="4"
+            ></textarea>
+          </div>
         </section>
 
         <div class="sidebar-footer">
@@ -95,7 +140,7 @@
             <textarea
               id="prompt-input"
               class="prompt-input"
-              placeholder="Send a message… (Enter to send, Shift+Enter for newline)"
+              placeholder="Load a model to start chatting…"
               rows="1"
               disabled
             ></textarea>
@@ -105,10 +150,26 @@
                 <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
               </svg>
             </button>
+            <button id="btn-stop" class="btn btn-stop hidden" title="Stop generation">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="4" y="4" width="16" height="16" rx="2"/>
+              </svg>
+            </button>
           </div>
           <div id="status-bar" class="status-bar"></div>
         </div>
       </main>
     </div>
+
+    <!-- Confirm delete dialog -->
+    <dialog id="confirm-dialog" class="confirm-dialog">
+      <div class="confirm-content">
+        <p id="confirm-text"></p>
+        <div class="confirm-actions">
+          <button id="confirm-ok"     class="btn btn-danger">Delete</button>
+          <button id="confirm-cancel" class="btn btn-ghost">Cancel</button>
+        </div>
+      </div>
+    </dialog>
   </body>
 </html>

@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use bytemuck::Pod;
-use wgpu::{BindGroupLayout, ComputePipeline, Device};
+use wgpu::{ComputePipeline, Device};
 
 use crate::engine::wgpu_context::GpuContext;
 
@@ -156,8 +156,7 @@ fn make_pipeline(device: &Device, label: &str, src: &str, entry: &str) -> Comput
         label: Some(label),
         layout: None,
         module: &module,
-        entry_point: Some(entry),
+        entry_point: entry,
         compilation_options: Default::default(),
-        cache: None,
     })
 }

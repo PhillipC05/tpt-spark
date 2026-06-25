@@ -1,6 +1,6 @@
 pub mod stub;
 
-#[cfg(feature = "engine-candle")]
+#[cfg(any(feature = "engine-candle", feature = "engine-wgpu"))]
 pub mod candle_engine;
 
 #[cfg(feature = "engine-wgpu")]
@@ -32,7 +32,10 @@ pub struct TokenEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceParams {
+    /// The full formatted prompt (may include conversation history).
     pub prompt: String,
+    /// Optional system/persona instruction prepended before the prompt.
+    pub system_prompt: Option<String>,
     pub max_tokens: u32,
     pub temperature: f32,
     pub top_p: f32,
@@ -43,6 +46,7 @@ impl Default for InferenceParams {
     fn default() -> Self {
         Self {
             prompt: String::new(),
+            system_prompt: None,
             max_tokens: 512,
             temperature: 0.7,
             top_p: 0.9,

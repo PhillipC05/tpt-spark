@@ -13,7 +13,6 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
-use candle_core::quantized::gguf_file;
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
@@ -22,7 +21,7 @@ use crate::engine::cpu_fallback::CpuFallback;
 use crate::engine::wgpu_context::GpuContext;
 use crate::engine::wgpu_kvcache::KvCache;
 use crate::engine::wgpu_loader::{load_gguf_to_vram, LoadedWeights};
-use crate::engine::wgpu_ops::{dispatch, readback_f32, BindingEntry, UniformBytes, WgpuPipelines};
+use crate::engine::wgpu_ops::{dispatch, readback_f32, BindingEntry, WgpuPipelines};
 use crate::engine::{InferenceParams, LlmEngine, ModelInfo, TokenEvent};
 
 // ── Top-level engine ───────────────────────────────────────────────────────────
@@ -74,7 +73,13 @@ impl LlmEngine for WgpuEngine {
                 .context("compiling WGSL shaders")?;
 
             let m = &weights.meta;
-            let kv_cache = KvCache::new(&ctx, m.n_layers, m.n_kv_heads, m.head_dim, m.context_length);
+            let kv_cache = KvCache::new(
+                &ctx,
+                m.n_layers,
+                m.n_kv_heads,
+                m.head_dim,
+                m.context_length,
+            );
 
             let name = path
                 .file_stem()
@@ -86,10 +91,7 @@ impl LlmEngine for WgpuEngine {
                 name: name.clone(),
                 path: model_path.to_string(),
                 size_bytes: weights.total_bytes,
-                backend: format!(
-                    "wgpu-{:?}",
-                    ctx.adapter_info.backend
-                ).to_lowercase(),
+                backend: format!("wgpu-{:?}", ctx.adapter_info.backend).to_lowercase(),
             };
 
             self.state = EngineState::Gpu(GpuModel {
@@ -114,8 +116,14 @@ impl LlmEngine for WgpuEngine {
     }
 
     fn unload(&mut self) -> Result<()> {
-        // Dropping GpuModel frees all wgpu::Buffer allocations (VRAM released).
-        self.state = EngineState::Empty;
+        // Take ownership of the old state so we can call destroy() before drop.
+        let old = std::mem::replace(&mut self.state, EngineState::Empty);
+        if let EngineState::Gpu(m) = old {
+            // Explicit destroy releases VRAM immediately rather than waiting for wgpu GC.
+            m.kv_cache.destroy();
+            m.weights.destroy();
+            // GpuModel (and its wgpu::Device/Queue) drops here.
+        }
         Ok(())
     }
 
@@ -162,10 +170,7 @@ fn gpu_infer(
     // Truncate prompt if it leaves no room for new tokens.
     let max_prompt = meta.context_length.saturating_sub(params.max_tokens as usize);
     if tokens.len() > max_prompt {
-        warn!(
-            "Prompt truncated {} → {} tokens",
-            tokens.len(), max_prompt
-        );
+        warn!("Prompt truncated {} → {} tokens", tokens.len(), max_prompt);
         let start = tokens.len() - max_prompt;
         tokens = tokens[start..].to_vec();
     }
@@ -179,27 +184,37 @@ fn gpu_infer(
     );
 
     // Reset KV cache for this conversation turn.
-    // Safety: KvCache::reset only zeros seq_len; buffer contents from prior run
-    // at positions beyond seq_len are never read.
-    // (Taking interior mutability via UnsafeCell is intentional — the engine is
-    // locked by EngineHandle's Mutex for the duration of infer().)
-    #[allow(clippy::cast_ref_to_mut)]
+    // SAFETY: `infer` is called with `m: &GpuModel` rather than `&mut GpuModel` because the
+    // LlmEngine trait requires `&self`.  The exclusive access invariant is upheld by the
+    // `EngineHandle` Mutex, which the caller holds for the entire duration of this call.
+    // No other thread can reach this code concurrently, making the aliased &mut sound.
     let kv_cache = unsafe { &mut *(std::ptr::addr_of!(m.kv_cache) as *mut KvCache) };
     kv_cache.reset();
 
-    // Allocate activation scratch buffers (reused each step).
     let embed_dim = meta.n_heads * meta.head_dim;
-    let ffn_intermediate = embed_dim * 4; // typical LLaMA FFN intermediate size
+    let ffn_dim = meta.ffn_hidden_size;
 
-    let act_x    = m.ctx.create_storage_buffer("act_x",    (embed_dim * 4) as u64);
-    let act_q    = m.ctx.create_storage_buffer("act_q",    (meta.n_heads * meta.head_dim * 4) as u64);
-    let act_k    = m.ctx.create_storage_buffer("act_k",    (meta.n_kv_heads * meta.head_dim * 4) as u64);
-    let act_v    = m.ctx.create_storage_buffer("act_v",    (meta.n_kv_heads * meta.head_dim * 4) as u64);
-    let act_attn = m.ctx.create_storage_buffer("act_attn", (meta.n_heads * meta.context_length * 4) as u64);
-    let act_gate = m.ctx.create_storage_buffer("act_gate", (ffn_intermediate * 4) as u64);
-    let act_up   = m.ctx.create_storage_buffer("act_up",   (ffn_intermediate * 4) as u64);
-    let act_out  = m.ctx.create_storage_buffer("act_out",  (embed_dim * 4) as u64);
-    let logit_buf = m.ctx.create_storage_buffer("logits",  (meta.vocab_size * 4) as u64);
+    // Allocate activation scratch buffers once — reused for every token.
+    let act_x     = m.ctx.create_storage_buffer("act_x",    (embed_dim * 4) as u64);
+    let act_q     = m.ctx.create_storage_buffer("act_q",    (meta.n_heads * meta.head_dim * 4) as u64);
+    let act_k     = m.ctx.create_storage_buffer("act_k",    (meta.n_kv_heads * meta.head_dim * 4) as u64);
+    let act_v     = m.ctx.create_storage_buffer("act_v",    (meta.n_kv_heads * meta.head_dim * 4) as u64);
+    let act_attn  = m.ctx.create_storage_buffer("act_attn", (meta.n_heads * meta.context_length * 4) as u64);
+    let act_gate  = m.ctx.create_storage_buffer("act_gate", (ffn_dim * 4) as u64);
+    let act_up    = m.ctx.create_storage_buffer("act_up",   (ffn_dim * 4) as u64);
+    let act_out   = m.ctx.create_storage_buffer("act_out",  (embed_dim * 4) as u64);
+    let logit_buf = m.ctx.create_storage_buffer("logits",   (meta.vocab_size * 4) as u64);
+
+    // Pre-allocate a dequantised embedding table buffer (vocab_size × embed_dim f32).
+    // Reused every forward pass to avoid a ~500 MB allocation per token.
+    let full_embed = m.ctx.create_storage_buffer(
+        "embed_full",
+        (meta.vocab_size * embed_dim * 4) as u64,
+    );
+    // Dequantise once here; the embedding table is static across all tokens.
+    if let Some(embed_buf) = m.weights.buffers.get("token_embd.weight") {
+        dequantize_tensor(&m.ctx, &m.pipelines, embed_buf, &full_embed, meta.vocab_size * embed_dim);
+    }
 
     let temperature = if params.temperature > 0.0 { Some(params.temperature as f64) } else { None };
     let top_p = if params.top_p < 1.0 { Some(params.top_p as f64) } else { None };
@@ -208,9 +223,12 @@ fn gpu_infer(
     // Prefill: run all prompt tokens through the model.
     let prompt_len = tokens.len();
     for (pos, &tok) in tokens.iter().enumerate() {
-        run_forward_pass(m, &act_x, &act_q, &act_k, &act_v, &act_attn,
-                         &act_gate, &act_up, &act_out, &logit_buf,
-                         kv_cache, tok, pos)?;
+        run_forward_pass(
+            m, &full_embed,
+            &act_x, &act_q, &act_k, &act_v, &act_attn,
+            &act_gate, &act_up, &act_out, &logit_buf,
+            kv_cache, tok, pos,
+        )?;
     }
 
     // Sample first token from prefill logits.
@@ -237,9 +255,12 @@ fn gpu_infer(
         tokens.push(next_token);
         generated += 1;
 
-        run_forward_pass(m, &act_x, &act_q, &act_k, &act_v, &act_attn,
-                         &act_gate, &act_up, &act_out, &logit_buf,
-                         kv_cache, next_token, pos)?;
+        run_forward_pass(
+            m, &full_embed,
+            &act_x, &act_q, &act_k, &act_v, &act_attn,
+            &act_gate, &act_up, &act_out, &logit_buf,
+            kv_cache, next_token, pos,
+        )?;
 
         let logit_vec = readback_f32(&m.ctx, &logit_buf, meta.vocab_size);
         next_token = sample_token(&mut logits_proc, &logit_vec, &tokens, params.repeat_penalty)?;
@@ -257,6 +278,7 @@ fn gpu_infer(
 #[allow(clippy::too_many_arguments)]
 fn run_forward_pass(
     m: &GpuModel,
+    full_embed: &wgpu::Buffer,   // pre-dequantised [vocab_size, embed_dim] f32
     act_x: &wgpu::Buffer,
     act_q: &wgpu::Buffer,
     act_k: &wgpu::Buffer,
@@ -277,35 +299,24 @@ fn run_forward_pass(
 
     let embed_dim = meta.n_heads * meta.head_dim;
 
-    // 1. Token embedding lookup: copy row `token` of the embedding table into act_x.
-    //    The embedding table is stored as a quantized buffer; we dequantize it.
-    let embed_key = "token_embd.weight";
-    if let Some(embed_buf) = w.get(embed_key) {
-        // For now: dequantize the full embedding table then copy the row.
-        // Phase 4 optimisation: add a dedicated embed-lookup shader.
-        let n_vocab = meta.vocab_size;
-        let full_embed = ctx.create_storage_buffer("embed_full", (n_vocab * embed_dim * 4) as u64);
-        dequantize_tensor(ctx, pipes, embed_buf, &full_embed, n_vocab * embed_dim);
-
-        // Copy token row into act_x.
-        let row_bytes = (embed_dim * 4) as u64;
-        let src_offset = token as u64 * row_bytes;
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(&full_embed, src_offset, act_x, 0, row_bytes);
-        ctx.queue.submit([enc.finish()]);
-    }
+    // 1. Token embedding lookup: copy row `token` from the pre-dequantised table.
+    let row_bytes = (embed_dim * 4) as u64;
+    let src_offset = token as u64 * row_bytes;
+    let mut enc = ctx.device.create_command_encoder(&Default::default());
+    enc.copy_buffer_to_buffer(full_embed, src_offset, act_x, 0, row_bytes);
+    ctx.queue.submit([enc.finish()]);
 
     // 2. Process each transformer layer.
     for layer in 0..meta.n_layers {
         let l = layer.to_string();
 
         // RMS norm before attention.
-        if let (Some(attn_norm), ) = (w.get(&format!("blk.{l}.attn_norm.weight")), ) {
+        if let Some(attn_norm) = w.get(&format!("blk.{l}.attn_norm.weight")) {
             dispatch_rms_norm(ctx, pipes, act_x, attn_norm, act_out, 1, embed_dim);
         }
 
         // Q, K, V projections.
-        let q_dim = meta.n_heads * meta.head_dim;
+        let q_dim  = meta.n_heads * meta.head_dim;
         let kv_dim = meta.n_kv_heads * meta.head_dim;
 
         if let Some(wq) = w.get(&format!("blk.{l}.attn_q.weight")) {
@@ -322,21 +333,23 @@ fn run_forward_pass(
         dispatch_rope(ctx, pipes, act_q, meta.n_heads, meta.head_dim, pos, meta.rope_freq_base);
         dispatch_rope(ctx, pipes, act_k, meta.n_kv_heads, meta.head_dim, pos, meta.rope_freq_base);
 
-        // Write K, V into cache at position `pos`.
+        // Write K, V into this layer's cache slot at position `pos`.
         let kv_row_bytes = (kv_dim * 4) as u64;
-        let k_offset = kv_cache.offset_bytes(layer, pos);
-        let v_offset = kv_cache.offset_bytes(layer, pos);
+        let kv_offset = kv_cache.offset_bytes(pos);
         let mut enc = ctx.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(act_k, 0, &kv_cache.k, k_offset, kv_row_bytes);
-        enc.copy_buffer_to_buffer(act_v, 0, &kv_cache.v, v_offset, kv_row_bytes);
+        enc.copy_buffer_to_buffer(act_k, 0, &kv_cache.k_layers[layer], kv_offset, kv_row_bytes);
+        enc.copy_buffer_to_buffer(act_v, 0, &kv_cache.v_layers[layer], kv_offset, kv_row_bytes);
         ctx.queue.submit([enc.finish()]);
 
         let kv_len = pos + 1;
 
-        // Attention scores, softmax, output.
-        dispatch_attention(ctx, pipes, act_q, &kv_cache.k, &kv_cache.v,
-                           act_attn, act_out,
-                           1, kv_len, meta.n_heads, meta.n_kv_heads, meta.head_dim, pos);
+        // Attention scores, softmax, weighted sum of V — operating on this layer's KV only.
+        dispatch_attention(
+            ctx, pipes,
+            act_q, &kv_cache.k_layers[layer], &kv_cache.v_layers[layer],
+            act_attn, act_out,
+            1, kv_len, meta.n_heads, meta.n_kv_heads, meta.head_dim, pos,
+        );
 
         // Attention output projection.
         if let Some(wo) = w.get(&format!("blk.{l}.attn_output.weight")) {
@@ -349,7 +362,7 @@ fn run_forward_pass(
         }
 
         // Feed-forward (SwiGLU).
-        let ffn_dim = embed_dim * 4;
+        let ffn_dim = meta.ffn_hidden_size;
         if let (Some(w_gate), Some(w_up), Some(w_down)) = (
             w.get(&format!("blk.{l}.ffn_gate.weight")),
             w.get(&format!("blk.{l}.ffn_up.weight")),
@@ -362,7 +375,7 @@ fn run_forward_pass(
         }
     }
 
-    // 3. Final RMS norm + LM head projection → logits.
+    // 3. Final RMS norm + LM head → logits.
     if let (Some(output_norm), Some(lm_head)) = (
         w.get("output_norm.weight"),
         w.get("output.weight"),
@@ -383,6 +396,7 @@ struct DequantParams { n_elements: u32, _pad: [u32; 3] }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+#[allow(non_snake_case)]
 struct GemmDims { M: u32, N: u32, K: u32, _pad: u32 }
 
 #[repr(C)]
@@ -414,9 +428,13 @@ struct AttnOutParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SiluParams { n_elements: u32, _pad: [u32; 3] }
 
-fn dequantize_tensor(ctx: &GpuContext, pipes: &WgpuPipelines, quant: &wgpu::Buffer, out: &wgpu::Buffer, n_elements: usize) {
+fn dequantize_tensor(
+    ctx: &GpuContext, pipes: &WgpuPipelines,
+    quant: &wgpu::Buffer, out: &wgpu::Buffer, n_elements: usize,
+) {
     let p = DequantParams { n_elements: n_elements as u32, _pad: [0; 3] };
-    dispatch(ctx, &pipes.dequant_q8,
+    dispatch(
+        ctx, &pipes.dequant_q8,
         &[BindingEntry { binding: 0, buffer: quant }, BindingEntry { binding: 1, buffer: out }],
         Some(&p),
         (n_elements as u32 + 255) / 256, 1, 1,
@@ -432,7 +450,8 @@ fn dequant_and_gemm(
     dequantize_tensor(ctx, pipes, weight_q, &weight_f32, n * k);
 
     let p = GemmDims { M: m as u32, N: n as u32, K: k as u32, _pad: 0 };
-    dispatch(ctx, &pipes.gemm,
+    dispatch(
+        ctx, &pipes.gemm,
         &[
             BindingEntry { binding: 0, buffer: input },
             BindingEntry { binding: 1, buffer: &weight_f32 },
@@ -445,9 +464,14 @@ fn dequant_and_gemm(
     );
 }
 
-fn dispatch_rms_norm(ctx: &GpuContext, pipes: &WgpuPipelines, input: &wgpu::Buffer, weight: &wgpu::Buffer, output: &wgpu::Buffer, n_rows: usize, dim: usize) {
+fn dispatch_rms_norm(
+    ctx: &GpuContext, pipes: &WgpuPipelines,
+    input: &wgpu::Buffer, weight: &wgpu::Buffer, output: &wgpu::Buffer,
+    n_rows: usize, dim: usize,
+) {
     let p = RmsNormParams { n_rows: n_rows as u32, dim: dim as u32, eps: 1e-5, _pad: 0 };
-    dispatch(ctx, &pipes.rms_norm,
+    dispatch(
+        ctx, &pipes.rms_norm,
         &[
             BindingEntry { binding: 0, buffer: input },
             BindingEntry { binding: 1, buffer: weight },
@@ -458,10 +482,17 @@ fn dispatch_rms_norm(ctx: &GpuContext, pipes: &WgpuPipelines, input: &wgpu::Buff
     );
 }
 
-fn dispatch_rope(ctx: &GpuContext, pipes: &WgpuPipelines, qk: &wgpu::Buffer, n_heads: usize, head_dim: usize, pos: usize, freq_base: f32) {
-    let p = RopeParams { n_heads: n_heads as u32, head_dim: head_dim as u32, seq_offset: pos as u32, freq_base };
+fn dispatch_rope(
+    ctx: &GpuContext, pipes: &WgpuPipelines,
+    qk: &wgpu::Buffer, n_heads: usize, head_dim: usize, pos: usize, freq_base: f32,
+) {
+    let p = RopeParams {
+        n_heads: n_heads as u32, head_dim: head_dim as u32,
+        seq_offset: pos as u32, freq_base,
+    };
     let n_pairs = n_heads * head_dim / 2;
-    dispatch(ctx, &pipes.rope,
+    dispatch(
+        ctx, &pipes.rope,
         &[BindingEntry { binding: 0, buffer: qk }],
         Some(&p),
         (n_pairs as u32 + 63) / 64, 1, 1,
@@ -480,7 +511,8 @@ fn dispatch_attention(
         n_heads: n_heads as u32, n_kv_heads: n_kv_heads as u32,
         head_dim: head_dim as u32, seq_offset: seq_offset as u32,
     };
-    dispatch(ctx, &pipes.attn_scores,
+    dispatch(
+        ctx, &pipes.attn_scores,
         &[
             BindingEntry { binding: 0, buffer: q },
             BindingEntry { binding: 1, buffer: k },
@@ -492,8 +524,12 @@ fn dispatch_attention(
         n_heads as u32,
     );
 
-    let sm_p = AttnSoftmaxParams { seq_len: seq_len as u32, kv_len: kv_len as u32, n_heads: n_heads as u32, _pad: 0 };
-    dispatch(ctx, &pipes.attn_softmax,
+    let sm_p = AttnSoftmaxParams {
+        seq_len: seq_len as u32, kv_len: kv_len as u32,
+        n_heads: n_heads as u32, _pad: 0,
+    };
+    dispatch(
+        ctx, &pipes.attn_softmax,
         &[BindingEntry { binding: 0, buffer: scores }],
         Some(&sm_p),
         (seq_len * n_heads) as u32, 1, 1,
@@ -504,7 +540,8 @@ fn dispatch_attention(
         n_heads: n_heads as u32, n_kv_heads: n_kv_heads as u32,
         head_dim: head_dim as u32, _pad: 0,
     };
-    dispatch(ctx, &pipes.attn_output,
+    dispatch(
+        ctx, &pipes.attn_output,
         &[
             BindingEntry { binding: 0, buffer: scores },
             BindingEntry { binding: 1, buffer: v },
@@ -517,9 +554,13 @@ fn dispatch_attention(
     );
 }
 
-fn dispatch_silu(ctx: &GpuContext, pipes: &WgpuPipelines, gate: &wgpu::Buffer, up: &wgpu::Buffer, n: usize) {
+fn dispatch_silu(
+    ctx: &GpuContext, pipes: &WgpuPipelines,
+    gate: &wgpu::Buffer, up: &wgpu::Buffer, n: usize,
+) {
     let p = SiluParams { n_elements: n as u32, _pad: [0; 3] };
-    dispatch(ctx, &pipes.silu,
+    dispatch(
+        ctx, &pipes.silu,
         &[
             BindingEntry { binding: 0, buffer: gate },
             BindingEntry { binding: 1, buffer: up },

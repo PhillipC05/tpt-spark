@@ -33,6 +33,8 @@ pub struct GgufMeta {
     pub head_dim: usize,
     pub vocab_size: usize,
     pub rope_freq_base: f32,
+    /// FFN intermediate (hidden) dimension, e.g. 11008 for LLaMA-1 7B, 14336 for LLaMA-3 8B.
+    pub ffn_hidden_size: usize,
 }
 
 /// Result of loading a model from disk into VRAM.
@@ -41,6 +43,16 @@ pub struct LoadedWeights {
     /// Tensor name → GPU storage buffer containing the raw quantized bytes.
     pub buffers: HashMap<String, wgpu::Buffer>,
     pub total_bytes: u64,
+}
+
+impl LoadedWeights {
+    /// Explicitly free all GPU buffer allocations. Call before drop when immediate
+    /// VRAM reclamation is required (e.g. on model unload).
+    pub fn destroy(&self) {
+        for buf in self.buffers.values() {
+            buf.destroy();
+        }
+    }
 }
 
 pub fn load_gguf_to_vram(path: &Path, ctx: &GpuContext) -> Result<LoadedWeights> {
@@ -75,9 +87,9 @@ pub fn load_gguf_to_vram(path: &Path, ctx: &GpuContext) -> Result<LoadedWeights>
     let mut total_bytes: u64 = 0;
 
     for (name, tensor_info) in &content.tensor_infos {
-        let offset = data_base + tensor_info.data_offset;
+        let offset = data_base + tensor_info.offset as usize;
         let byte_len = tensor_info.shape.elem_count() * tensor_info.ggml_dtype.type_size()
-            / tensor_info.ggml_dtype.blck_size();
+            / tensor_info.ggml_dtype.block_size();
 
         if offset + byte_len > mmap.len() {
             anyhow::bail!("tensor '{}' extends past end of file", name);
@@ -171,6 +183,15 @@ fn extract_meta(meta: &HashMap<String, gguf_file::Value>) -> Result<GgufMeta> {
 
     let head_dim = embed_dim / n_heads;
 
+    // Read the true FFN intermediate size from metadata.
+    // Falls back to a LLaMA-style SwiGLU estimate (rounds up to 256-multiple) when absent.
+    let ffn_hidden_size = meta_u64(meta, &format!("{a}.feed_forward_length"))
+        .map(|v| v as usize)
+        .unwrap_or_else(|| {
+            let est = (embed_dim * 8).div_ceil(3);
+            est.div_ceil(256) * 256
+        });
+
     Ok(GgufMeta {
         architecture,
         context_length,
@@ -180,5 +201,6 @@ fn extract_meta(meta: &HashMap<String, gguf_file::Value>) -> Result<GgufMeta> {
         head_dim,
         vocab_size,
         rope_freq_base,
+        ffn_hidden_size,
     })
 }
