@@ -92,8 +92,11 @@ const systemPromptInput = q<HTMLTextAreaElement>("#system-prompt");
 const btnToggleSysPrompt = q<HTMLButtonElement>("#btn-toggle-sysprompt");
 const syspromptPanel   = q<HTMLDivElement>("#sysprompt-panel");
 
+const btnBrowseModels  = q<HTMLButtonElement>("#btn-browse-models");
+
 const btnToggleDownload = q<HTMLButtonElement>("#btn-toggle-download");
 const downloadPanel    = q<HTMLDivElement>("#download-panel");
+const btnHF            = q<HTMLButtonElement>("#btn-hf");
 const dlUrl            = q<HTMLInputElement>("#dl-url");
 const dlFilename       = q<HTMLInputElement>("#dl-filename");
 const btnDownload      = q<HTMLButtonElement>("#btn-download");
@@ -127,9 +130,12 @@ async function init() {
   btnStop.addEventListener("click", handleStop);
   btnNewConv.addEventListener("click", startNewConversation);
 
+  btnBrowseModels.addEventListener("click", handleBrowseModels);
+
   btnToggleSysPrompt.addEventListener("click", () => togglePanel(syspromptPanel, btnToggleSysPrompt));
   btnToggleDownload.addEventListener("click", () => togglePanel(downloadPanel, btnToggleDownload));
   btnDownload.addEventListener("click", handleDownload);
+  btnHF.addEventListener("click", () => invoke("open_external_url", { url: "https://huggingface.co/models?search=gguf&sort=downloads&library=gguf" }));
 
   modelSelect.addEventListener("change", () => {
     btnLoad.disabled = !modelSelect.value;
@@ -169,6 +175,19 @@ async function loadModelsDir() {
     modelsDirEl.textContent = dir;
   } catch {
     modelsDirEl.textContent = "unavailable";
+  }
+}
+
+async function handleBrowseModels() {
+  try {
+    const dir: string | null = await invoke("pick_models_dir");
+    if (dir) {
+      modelsDirEl.textContent = dir;
+      setStatus("Models directory updated. Refreshing…");
+      await refreshModelList();
+    }
+  } catch (e) {
+    setStatus(`Could not change models directory: ${e}`);
   }
 }
 
@@ -662,4 +681,18 @@ function autoTitle(conv: Conversation, firstUserMsg: string) {
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-window.addEventListener("DOMContentLoaded", init);
+
+function waitForTauri(): Promise<void> {
+  return new Promise((resolve) => {
+    if ((window as any).__TAURI_INTERNALS__) { resolve(); return; }
+    const id = setInterval(() => {
+      if ((window as any).__TAURI_INTERNALS__) { clearInterval(id); resolve(); }
+    }, 20);
+    setTimeout(() => { clearInterval(id); resolve(); }, 5000);
+  });
+}
+
+window.addEventListener("DOMContentLoaded", async () => {
+  await waitForTauri();
+  await init();
+});

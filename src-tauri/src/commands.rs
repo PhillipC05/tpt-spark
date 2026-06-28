@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{ipc::Channel, State};
 use tracing::{error, info};
 
 pub struct CancelFlag(pub Arc<AtomicBool>);
 
-pub struct ModelsDir(pub PathBuf);
+pub struct ModelsDir(pub Mutex<PathBuf>);
 pub struct HistoryDir(pub PathBuf);
 
 // ── Model management ────────────────────────────────────────────────────────
@@ -24,12 +24,13 @@ pub struct HistoryDir(pub PathBuf);
 pub async fn list_models(
     models_dir: State<'_, ModelsDir>,
 ) -> Result<Vec<ModelEntry>, String> {
-    scan_models_dir(&models_dir.0).map_err(|e| e.to_string())
+    let dir = models_dir.0.lock().unwrap().clone();
+    scan_models_dir(&dir).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_models_dir(models_dir: State<'_, ModelsDir>) -> Result<String, String> {
-    Ok(models_dir.0.to_string_lossy().to_string())
+    Ok(models_dir.0.lock().unwrap().to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -70,7 +71,7 @@ pub async fn delete_model(
 ) -> Result<(), String> {
     let canonical = fs::canonicalize(&path)
         .map_err(|e| format!("invalid path: {e}"))?;
-    let models_canonical = fs::canonicalize(&models_dir.0)
+    let models_canonical = fs::canonicalize(&*models_dir.0.lock().unwrap())
         .map_err(|e| format!("models dir error: {e}"))?;
     if !canonical.starts_with(&models_canonical) {
         return Err("path is outside the models directory".into());
@@ -117,7 +118,7 @@ pub async fn download_model(
         .to_str()
         .ok_or_else(|| "filename is not valid UTF-8".to_string())?
         .to_owned();
-    let dest = models_dir.0.join(&safe_name);
+    let dest = models_dir.0.lock().unwrap().join(&safe_name);
 
     info!("Downloading model from {} → {}", url, dest.display());
 
@@ -261,6 +262,45 @@ pub async fn delete_conv(
     history_dir: State<'_, HistoryDir>,
 ) -> Result<(), String> {
     delete_conversation(&history_dir.0, &id).map_err(|e| e.to_string())
+}
+
+// ── Models directory picker ──────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn pick_models_dir(
+    app_handle: tauri::AppHandle,
+    models_dir: State<'_, ModelsDir>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    use tokio::sync::oneshot;
+
+    let (tx, rx) = oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
+    app_handle.dialog().file().pick_folder(move |result| {
+        let _ = tx.send(result);
+    });
+
+    match rx.await.map_err(|e| format!("dialog closed: {e}"))? {
+        Some(folder_path) => {
+            let path_buf = folder_path
+                .into_path()
+                .map_err(|e| format!("invalid path: {e}"))?;
+            fs::create_dir_all(&path_buf)
+                .map_err(|e| format!("cannot create dir: {e}"))?;
+            info!("Models directory changed to: {}", path_buf.display());
+            *models_dir.0.lock().unwrap() = path_buf.clone();
+            Ok(Some(path_buf.to_string_lossy().to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+// ── Shell helpers ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+#[allow(deprecated)]
+pub async fn open_external_url(url: String, app_handle: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+    app_handle.shell().open(url, None).map_err(|e| e.to_string())
 }
 
 // ── System info ──────────────────────────────────────────────────────────────

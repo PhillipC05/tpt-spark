@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# TPT Code Command Center — contains API keys and session token
+.vscode/settings.json

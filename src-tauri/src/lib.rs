@@ -7,7 +7,7 @@ use commands::{CancelFlag, HistoryDir, ModelsDir};
 use conversation::history_dir;
 use engine::default_engine;
 use models::default_models_dir;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use tauri::Manager;
 use tracing::info;
 
@@ -33,7 +33,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             app.manage(default_engine());
-            app.manage(ModelsDir(models_dir));
+            app.manage(ModelsDir(Mutex::new(models_dir)));
             app.manage(HistoryDir(hist_dir));
             app.manage(CancelFlag(Arc::new(AtomicBool::new(false))));
             Ok(())
@@ -53,6 +53,8 @@ pub fn run() {
             commands::delete_conv,
             commands::get_system_info,
             commands::cancel_inference,
+            commands::pick_models_dir,
+            commands::open_external_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TPT Spark");
