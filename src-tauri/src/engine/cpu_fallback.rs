@@ -14,8 +14,8 @@ impl CpuFallback {
 }
 
 impl LlmEngine for CpuFallback {
-    fn load(&mut self, model_path: &str) -> Result<ModelInfo> {
-        let mut info = self.0.load(model_path)?;
+    fn load(&mut self, model_path: &str, on_progress: Option<&(dyn Fn(u32, u32) + Send + Sync)>) -> Result<ModelInfo> {
+        let mut info = self.0.load(model_path, on_progress)?;
         info.backend = "wgpu-cpu-fallback".to_string();
         Ok(info)
     }

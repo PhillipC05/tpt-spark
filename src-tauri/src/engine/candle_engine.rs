@@ -124,7 +124,7 @@ fn meta_u64(meta: &std::collections::HashMap<String, gguf_file::Value>, key: &st
 // ── LlmEngine implementation ──────────────────────────────────────────────────
 
 impl LlmEngine for CandleEngine {
-    fn load(&mut self, model_path: &str) -> Result<ModelInfo> {
+    fn load(&mut self, model_path: &str, _on_progress: Option<&(dyn Fn(u32, u32) + Send + Sync)>) -> Result<ModelInfo> {
         let path = Path::new(model_path);
 
         info!("Reading GGUF into memory: {}", model_path);

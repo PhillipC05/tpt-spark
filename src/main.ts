@@ -29,6 +29,12 @@ interface DownloadProgress {
   error: string | null;
 }
 
+interface LoadProgress {
+  tensorsDone: number;
+  tensorsTotal: number;
+  done: boolean;
+}
+
 interface SystemInfo {
   backend: string;
   engineLoaded: boolean;
@@ -237,10 +243,18 @@ async function handleLoadModel() {
   if (!path) return;
 
   setModelLoading();
-  setStatus("Loading model…");
+  setStatus("Loading model… (uploading weights to VRAM)");
+
+  const channel = new Channel<LoadProgress>();
+  channel.onmessage = (ev) => {
+    if (!ev.done && ev.tensorsTotal > 0) {
+      const pct = Math.round((ev.tensorsDone / ev.tensorsTotal) * 100);
+      setStatus(`Loading model… ${pct}% (${ev.tensorsDone}/${ev.tensorsTotal} tensors)`);
+    }
+  };
 
   try {
-    const info: ModelInfo = await invoke("load_model", { path });
+    const info: ModelInfo = await invoke("load_model", { path, channel });
     loadedModelName = info.name;
     setModelLoaded(info);
     setStatus(`Model loaded: ${info.name}`);
@@ -687,12 +701,26 @@ function waitForTauri(): Promise<void> {
     if ((window as any).__TAURI_INTERNALS__) { resolve(); return; }
     const id = setInterval(() => {
       if ((window as any).__TAURI_INTERNALS__) { clearInterval(id); resolve(); }
-    }, 20);
-    setTimeout(() => { clearInterval(id); resolve(); }, 5000);
+    }, 10);
+    setTimeout(() => { clearInterval(id); resolve(); }, 8000);
   });
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
   await waitForTauri();
+  if (!(window as any).__TAURI_INTERNALS__) {
+    document.body.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0">
+        <div style="text-align:center;max-width:400px;padding:2rem">
+          <div style="font-size:3rem;margin-bottom:1rem">⚡</div>
+          <h2 style="margin:0 0 .5rem;font-size:1.4rem">TPT Spark</h2>
+          <p style="margin:0 0 1rem;color:#94a3b8;font-size:.9rem">
+            This app must run inside the Tauri desktop shell.<br/>
+            Open it with <code style="background:#1e2533;padding:2px 6px;border-radius:4px">npm run tauri dev</code> instead.
+          </p>
+        </div>
+      </div>`;
+    return;
+  }
   await init();
 });

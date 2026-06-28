@@ -1,28 +1,18 @@
-// Dequantize Q4_K blocks to f32.
+// Dequantize Q5_K blocks to f32.
 //
-// Q4_K layout (per 256-element block, 144 bytes total):
-//   bytes  0-1  : d    (f16 super-scale for quantised scales)
-//   bytes  2-3  : dmin (f16 super-scale for quantised mins)
-//   bytes  4-15 : scales[12] — 8 × 6-bit scale + 8 × 6-bit min packed per get_scale_min_k4
-//   bytes 16-143: qs[128]    — 256 × 4-bit nibbles
+// Q5_K layout (per 256-element block, 176 bytes):
+//   bytes   0-1 : d    (f16 super-scale)
+//   bytes   2-3 : dmin (f16 super-min)
+//   bytes  4-15 : scales[12] — same get_scale_min_k4 packing as Q4_K
+//   bytes 16-47 : qh[32]     — 256 high bits (bit i of qh[i/8])
+//   bytes 48-175: qs[128]    — 256 × 4-bit low nibbles, same split as Q4_K
 //
-// Nibble layout (llama.cpp canonical):
-//   qs byte j: low nibble → element j (j < 128), high nibble → element j+128
-//   i.e. elements 0..127 use low nibbles of qs[0..127],
-//        elements 128..255 use high nibbles of qs[0..127].
-//
-// Scale layout (get_scale_min_k4, j = 0..7):
-//   j < 4:  scale = scales[j] & 63,         min = scales[j+4] & 63
-//   j >= 4: scale = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
-//           min   = (scales[j+4] >> 4)  | ((scales[j]   >> 6) << 4)
-//
-// Sub-block assignment for element i:
-//   Elements 0..127 (low nibbles):  j = i/32,       scale_idx = 2*j
-//   Elements 128..255 (hi nibbles): j = (i-128)/32, scale_idx = 2*j + 1
+// 5-bit value: q5 = lo4 | (high_bit << 4)  → range 0..31
+// Sub-block:   same 8-group / 32-element split as Q4_K (scale_idx formula identical).
+// Dequant:     x[i] = d * scale_6bit * q5 - dmin * min_6bit
 //
 // Dispatch: one thread per output element.
 //   workgroup_size = (256, 1, 1)
-//   dispatch((n_elements + 255) / 256, 1, 1)
 
 struct Params { n_elements: u32 }
 
@@ -47,7 +37,6 @@ fn decode_f16(lo: u32, hi: u32) -> f32 {
     return (1.0 - 2.0 * sign) * pow(2.0, f32(exp - 15)) * (1.0 + mant / 1024.0);
 }
 
-// Extract j-th scale value (j = 0..7) from 12-byte scales region at `base`.
 fn get_scale_k4(base: u32, j: u32) -> f32 {
     var d: u32;
     if j < 4u {
@@ -59,7 +48,6 @@ fn get_scale_k4(base: u32, j: u32) -> f32 {
     return f32(d);
 }
 
-// Extract j-th min value (j = 0..7) from 12-byte scales region at `base`.
 fn get_min_k4(base: u32, j: u32) -> f32 {
     var m: u32;
     if j < 4u {
@@ -78,15 +66,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let block_idx = elem_idx / 256u;
     let lane      = elem_idx % 256u;
-    let bb        = block_idx * 144u;   // block byte base
+    let bb        = block_idx * 176u;
 
     let d    = decode_f16(read_byte(bb),      read_byte(bb + 1u));
     let dmin = decode_f16(read_byte(bb + 2u), read_byte(bb + 3u));
 
-    let scale_base  = bb + 4u;   // 12 bytes of scale/min data
-    let nibble_base = bb + 16u;  // 128 bytes of nibbles
+    let scale_base  = bb + 4u;   // 12 bytes
+    let qh_base     = bb + 16u;  // 32 bytes
+    let nibble_base = bb + 48u;  // 128 bytes
 
-    // Determine sub-block index j (0..7) for scale and min lookup.
+    // Same sub-block / scale index as Q4_K.
     var j: u32;
     if lane < 128u {
         j = lane / 32u;
@@ -98,7 +87,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let scale = d    * get_scale_k4(scale_base, scale_idx);
     let min   = dmin * get_min_k4  (scale_base, scale_idx);
 
-    // Nibble lookup: element i < 128 → low nibble of qs[i]; i >= 128 → high nibble of qs[i-128].
+    // High bit from qh: bit `lane` of the 256-bit qh array.
+    let high_bit = (read_byte(qh_base + lane / 8u) >> (lane % 8u)) & 1u;
+
+    // Low nibble: same Q4_K split layout (elements 0..127 → low, 128..255 → high).
     var qs_idx: u32;
     var use_hi: bool;
     if lane < 128u {
@@ -108,8 +100,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         qs_idx = lane - 128u;
         use_hi = true;
     }
-    let raw    = read_byte(nibble_base + qs_idx);
-    let nibble = select(raw & 0x0Fu, (raw >> 4u) & 0x0Fu, use_hi);
+    let raw = read_byte(nibble_base + qs_idx);
+    let lo4 = select(raw & 0x0Fu, (raw >> 4u) & 0x0Fu, use_hi);
 
-    out_f32[elem_idx] = scale * f32(nibble) - min;
+    let q5 = lo4 | (high_bit << 4u);   // 0..31
+    out_f32[elem_idx] = scale * f32(q5) - min;
 }

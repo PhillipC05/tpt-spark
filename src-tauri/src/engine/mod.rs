@@ -57,7 +57,14 @@ impl Default for InferenceParams {
 
 /// Core trait that every engine backend must implement.
 pub trait LlmEngine: Send + Sync {
-    fn load(&mut self, model_path: &str) -> Result<ModelInfo>;
+    /// Load a model from `model_path`.  `on_progress(done, total)` is called after each
+    /// tensor is uploaded so the caller can report incremental progress.  Pass `None` to
+    /// suppress progress callbacks (e.g. stub / candle engines that finish instantly).
+    fn load(
+        &mut self,
+        model_path: &str,
+        on_progress: Option<&(dyn Fn(u32, u32) + Send + Sync)>,
+    ) -> Result<ModelInfo>;
     fn unload(&mut self) -> Result<()>;
     fn is_loaded(&self) -> bool;
     fn model_info(&self) -> Option<&ModelInfo>;

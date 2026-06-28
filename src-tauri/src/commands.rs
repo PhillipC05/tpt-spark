@@ -17,8 +17,17 @@ pub struct CancelFlag(pub Arc<AtomicBool>);
 
 pub struct ModelsDir(pub Mutex<PathBuf>);
 pub struct HistoryDir(pub PathBuf);
+pub struct ConfigPath(pub PathBuf);
 
 // ── Model management ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadProgress {
+    pub tensors_done: u32,
+    pub tensors_total: u32,
+    pub done: bool,
+}
 
 #[tauri::command]
 pub async fn list_models(
@@ -36,14 +45,18 @@ pub async fn get_models_dir(models_dir: State<'_, ModelsDir>) -> Result<String, 
 #[tauri::command]
 pub async fn load_model(
     path: String,
+    channel: Channel<LoadProgress>,
     engine: State<'_, EngineHandle>,
 ) -> Result<ModelInfo, String> {
     info!("Loading model: {}", path);
     let mut eng = engine.lock().await;
     tokio::task::block_in_place(|| {
-        eng.load(&path).map_err(|e| {
-            error!("Failed to load model: {}", e);
-            e.to_string()
+        let cb = move |done: u32, total: u32| {
+            let _ = channel.send(LoadProgress { tensors_done: done, tensors_total: total, done: false });
+        };
+        eng.load(&path, Some(&cb)).map_err(|e| {
+            error!("Failed to load model: {:#}", e);
+            format!("{:#}", e)
         })
     })
 }
@@ -270,7 +283,9 @@ pub async fn delete_conv(
 pub async fn pick_models_dir(
     app_handle: tauri::AppHandle,
     models_dir: State<'_, ModelsDir>,
+    config_path: State<'_, ConfigPath>,
 ) -> Result<Option<String>, String> {
+    use crate::config::AppConfig;
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 
@@ -288,6 +303,12 @@ pub async fn pick_models_dir(
                 .map_err(|e| format!("cannot create dir: {e}"))?;
             info!("Models directory changed to: {}", path_buf.display());
             *models_dir.0.lock().unwrap() = path_buf.clone();
+
+            let cfg = AppConfig { models_dir: Some(path_buf.to_string_lossy().to_string()) };
+            if let Err(e) = cfg.save(&config_path.0) {
+                tracing::warn!("Failed to persist models dir config: {e}");
+            }
+
             Ok(Some(path_buf.to_string_lossy().to_string()))
         }
         None => Ok(None),

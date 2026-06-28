@@ -1,7 +1,7 @@
 //! Stub engine – compiles everywhere, streams mock tokens.
-//! Replace with engine-llama feature for real inference.
+//! Replace with engine-candle or engine-wgpu feature for real inference.
 
-#![cfg_attr(feature = "engine-candle", allow(dead_code))]
+#![cfg_attr(any(feature = "engine-candle", feature = "engine-wgpu"), allow(dead_code))]
 
 use super::{InferenceParams, LlmEngine, ModelInfo, TokenEvent};
 use anyhow::Result;
@@ -20,7 +20,7 @@ impl StubEngine {
 }
 
 impl LlmEngine for StubEngine {
-    fn load(&mut self, model_path: &str) -> Result<ModelInfo> {
+    fn load(&mut self, model_path: &str, _on_progress: Option<&(dyn Fn(u32, u32) + Send + Sync)>) -> Result<ModelInfo> {
         let path = Path::new(model_path);
         let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let name = path
@@ -59,9 +59,8 @@ impl LlmEngine for StubEngine {
     ) -> Result<()> {
         let response = format!(
             "[Stub engine] Echo: \"{}\"\n\nThis is a placeholder response. \
-            Load a real GGUF model and enable the `engine-llama` feature to \
-            get actual LLM inference. The architecture uses wgpu for GPU \
-            dispatch and llama-cpp-rs for optimized GGUF execution.",
+            Build with `--features engine-candle` for CPU inference via HuggingFace candle, \
+            or `--features engine-wgpu` for GPU inference via wgpu + custom WGSL shaders.",
             params.prompt.trim()
         );
 

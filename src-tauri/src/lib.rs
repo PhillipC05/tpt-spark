@@ -1,9 +1,11 @@
 mod commands;
+mod config;
 mod conversation;
 mod engine;
 mod models;
 
-use commands::{CancelFlag, HistoryDir, ModelsDir};
+use commands::{CancelFlag, ConfigPath, HistoryDir, ModelsDir};
+use config::{default_config_path, AppConfig};
 use conversation::history_dir;
 use engine::default_engine;
 use models::default_models_dir;
@@ -22,7 +24,17 @@ pub fn run() {
 
     info!("TPT Spark starting");
 
-    let models_dir = default_models_dir();
+    let config_path = default_config_path();
+    let cfg = AppConfig::load(&config_path);
+
+    let models_dir = cfg.models_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .unwrap_or_else(default_models_dir);
+
+    info!("Models directory: {}", models_dir.display());
+
     let hist_dir = history_dir(
         &dirs_next::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
     );
@@ -35,6 +47,7 @@ pub fn run() {
             app.manage(default_engine());
             app.manage(ModelsDir(Mutex::new(models_dir)));
             app.manage(HistoryDir(hist_dir));
+            app.manage(ConfigPath(config_path));
             app.manage(CancelFlag(Arc::new(AtomicBool::new(false))));
             Ok(())
         })

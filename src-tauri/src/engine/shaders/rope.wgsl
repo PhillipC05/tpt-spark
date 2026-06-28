@@ -13,6 +13,8 @@ struct Params {
     head_dim:   u32,   // full head dim (pairs = head_dim / 2)
     seq_offset: u32,   // position of the first token in this call (= existing seq_len)
     freq_base:  f32,
+    rope_scale: f32,   // linear RoPE scale factor (1.0 = no scaling); pos is divided by this
+    _pad:       u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> qk_data : array<f32>;
@@ -32,7 +34,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pair  = pair_idx % half_dim;
     let pos   = params.seq_offset + token_idx;
 
-    let theta = f32(pos) / pow(params.freq_base, f32(pair * 2u) / f32(params.head_dim));
+    let theta = (f32(pos) / params.rope_scale) / pow(params.freq_base, f32(pair * 2u) / f32(params.head_dim));
     let c = cos(theta);
     let s = sin(theta);
 

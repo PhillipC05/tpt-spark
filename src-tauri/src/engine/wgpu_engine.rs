@@ -9,6 +9,7 @@
 //!
 //! KV cache is reset on each infer() call so there is no stale state between conversations.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -20,7 +21,9 @@ use tracing::{info, warn};
 use crate::engine::cpu_fallback::CpuFallback;
 use crate::engine::wgpu_context::GpuContext;
 use crate::engine::wgpu_kvcache::KvCache;
-use crate::engine::wgpu_loader::{load_gguf_to_vram, LoadedWeights};
+use candle_core::quantized::GgmlDType;
+
+use crate::engine::wgpu_loader::{load_gguf_to_vram, FfnActivation, GgufMeta, GpuTensor, LoadedWeights};
 use crate::engine::wgpu_ops::{dispatch, readback_f32, BindingEntry, WgpuPipelines};
 use crate::engine::{InferenceParams, LlmEngine, ModelInfo, TokenEvent};
 
@@ -55,7 +58,11 @@ impl WgpuEngine {
 // ── LlmEngine impl ─────────────────────────────────────────────────────────────
 
 impl LlmEngine for WgpuEngine {
-    fn load(&mut self, model_path: &str) -> Result<ModelInfo> {
+    fn load(
+        &mut self,
+        model_path: &str,
+        on_progress: Option<&(dyn Fn(u32, u32) + Send + Sync)>,
+    ) -> Result<ModelInfo> {
         let path = Path::new(model_path);
 
         // Try to acquire a GPU context; fall back to CPU if none available.
@@ -63,7 +70,7 @@ impl LlmEngine for WgpuEngine {
 
         if let Some(ctx) = gpu_ctx {
             info!("GPU context acquired; loading weights into VRAM");
-            let weights = load_gguf_to_vram(path, &ctx)
+            let weights = load_gguf_to_vram(path, &ctx, on_progress)
                 .context("uploading GGUF weights to VRAM")?;
 
             let tokenizer = find_tokenizer(path)?;
@@ -109,7 +116,7 @@ impl LlmEngine for WgpuEngine {
         } else {
             info!("No GPU available; falling back to candle CPU engine");
             let mut fb = CpuFallback::new();
-            let info = fb.load(model_path)?;
+            let info = fb.load(model_path, on_progress)?;
             self.state = EngineState::Cpu(fb);
             Ok(info)
         }
@@ -167,29 +174,37 @@ fn gpu_infer(
         .map_err(|e| anyhow::anyhow!("tokenize: {}", e))?;
     let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
 
+    // SAFETY: `infer` is called with `m: &GpuModel` rather than `&mut GpuModel` because the
+    // LlmEngine trait requires `&self`.  The exclusive access invariant is upheld by the
+    // `EngineHandle` Mutex, which the caller holds for the entire duration of this call.
+    // No other thread can reach this code concurrently, making the aliased &mut sound.
+    let kv_cache = unsafe { &mut *(std::ptr::addr_of!(m.kv_cache) as *mut KvCache) };
+
     // Truncate prompt if it leaves no room for new tokens.
     let max_prompt = meta.context_length.saturating_sub(params.max_tokens as usize);
     if tokens.len() > max_prompt {
         warn!("Prompt truncated {} → {} tokens", tokens.len(), max_prompt);
         let start = tokens.len() - max_prompt;
         tokens = tokens[start..].to_vec();
+        // Truncation removes the front of the sequence, breaking position alignment
+        // with any K/V entries already in the cache.  Force a full reset.
+        kv_cache.reset();
     }
     if tokens.is_empty() {
         bail!("prompt is empty after tokenization");
     }
 
-    info!(
-        "GPU inference: prompt_tokens={} max_new={} temp={}",
-        tokens.len(), params.max_tokens, params.temperature
-    );
+    // Prefix caching: find how many leading tokens are already in the GPU KV cache
+    // from the previous turn.  Those positions don't need to be recomputed.
+    let prefix_len = kv_cache.common_prefix_len(&tokens);
+    if prefix_len == 0 {
+        kv_cache.reset();
+    }
 
-    // Reset KV cache for this conversation turn.
-    // SAFETY: `infer` is called with `m: &GpuModel` rather than `&mut GpuModel` because the
-    // LlmEngine trait requires `&self`.  The exclusive access invariant is upheld by the
-    // `EngineHandle` Mutex, which the caller holds for the entire duration of this call.
-    // No other thread can reach this code concurrently, making the aliased &mut sound.
-    let kv_cache = unsafe { &mut *(std::ptr::addr_of!(m.kv_cache) as *mut KvCache) };
-    kv_cache.reset();
+    info!(
+        "GPU inference: prompt_tokens={} cached_prefix={} new_to_compute={} max_new={} temp={}",
+        tokens.len(), prefix_len, tokens.len() - prefix_len, params.max_tokens, params.temperature
+    );
 
     let embed_dim = meta.n_heads * meta.head_dim;
     let ffn_dim = meta.ffn_hidden_size;
@@ -204,6 +219,12 @@ fn gpu_infer(
     let act_up    = m.ctx.create_storage_buffer("act_up",   (ffn_dim * 4) as u64);
     let act_out   = m.ctx.create_storage_buffer("act_out",  (embed_dim * 4) as u64);
     let logit_buf = m.ctx.create_storage_buffer("logits",   (meta.vocab_size * 4) as u64);
+    // MoE accumulation scratch: weighted sum of expert outputs per layer (embed_dim f32).
+    let moe_out = if meta.n_experts > 0 {
+        Some(m.ctx.create_storage_buffer("moe_out", (embed_dim * 4) as u64))
+    } else {
+        None
+    };
 
     // Pre-allocate a dequantised embedding table buffer (vocab_size × embed_dim f32).
     // Reused every forward pass to avoid a ~500 MB allocation per token.
@@ -220,16 +241,25 @@ fn gpu_infer(
     let top_p = if params.top_p < 1.0 { Some(params.top_p as f64) } else { None };
     let mut logits_proc = LogitsProcessor::new(42, temperature, top_p);
 
-    // Prefill: run all prompt tokens through the model.
+    // Prefill: only run positions [prefix_len..prompt_len) — the earlier positions
+    // already have valid K/V entries from the previous turn.
     let prompt_len = tokens.len();
-    for (pos, &tok) in tokens.iter().enumerate() {
+    for pos in prefix_len..prompt_len {
         run_forward_pass(
             m, &full_embed,
             &act_x, &act_q, &act_k, &act_v, &act_attn,
             &act_gate, &act_up, &act_out, &logit_buf,
-            kv_cache, tok, pos,
+            kv_cache, tokens[pos], pos, moe_out.as_ref(),
         )?;
     }
+    // When the entire prompt was cached (prefix_len == prompt_len), the prefill
+    // loop body never executes and seq_len would not be updated.  Set it explicitly.
+    if prefix_len == prompt_len {
+        kv_cache.seq_len = prompt_len;
+    }
+
+    // Record the full prompt token sequence now resident in the GPU cache.
+    kv_cache.cached_tokens = tokens.clone();
 
     // Sample first token from prefill logits.
     let logit_vec = readback_f32(&m.ctx, &logit_buf, meta.vocab_size);
@@ -251,15 +281,23 @@ fn gpu_infer(
             .decode(&[next_token], true)
             .map_err(|e| anyhow::anyhow!("decode: {}", e))?;
 
-        on_token(TokenEvent { token: token_str, done: false })?;
+        // Emit the token; if the callback signals cancellation, send done: true
+        // before returning so the frontend can reset its generating state.
+        if let Err(e) = on_token(TokenEvent { token: token_str, done: false }) {
+            let _ = on_token(TokenEvent { token: String::new(), done: true });
+            return Err(e);
+        }
+
         tokens.push(next_token);
+        kv_cache.cached_tokens.push(next_token); // keep GPU state and token record in sync
+
         generated += 1;
 
         run_forward_pass(
             m, &full_embed,
             &act_x, &act_q, &act_k, &act_v, &act_attn,
             &act_gate, &act_up, &act_out, &logit_buf,
-            kv_cache, next_token, pos,
+            kv_cache, next_token, pos, moe_out.as_ref(),
         )?;
 
         let logit_vec = readback_f32(&m.ctx, &logit_buf, meta.vocab_size);
@@ -291,6 +329,7 @@ fn run_forward_pass(
     kv_cache: &mut KvCache,
     token: u32,
     pos: usize,
+    moe_out: Option<&wgpu::Buffer>,
 ) -> Result<()> {
     let ctx = &m.ctx;
     let pipes = &m.pipelines;
@@ -306,32 +345,58 @@ fn run_forward_pass(
     enc.copy_buffer_to_buffer(full_embed, src_offset, act_x, 0, row_bytes);
     ctx.queue.submit([enc.finish()]);
 
+    let eps = meta.rms_norm_eps;
+
     // 2. Process each transformer layer.
     for layer in 0..meta.n_layers {
         let l = layer.to_string();
 
         // RMS norm before attention.
         if let Some(attn_norm) = w.get(&format!("blk.{l}.attn_norm.weight")) {
-            dispatch_rms_norm(ctx, pipes, act_x, attn_norm, act_out, 1, embed_dim);
+            dispatch_rms_norm(ctx, pipes, act_x, &attn_norm.buffer, act_out, 1, embed_dim, eps);
         }
 
-        // Q, K, V projections.
+        // Q, K, V projections — fused (attn_qkv.weight) or separate.
         let q_dim  = meta.n_heads * meta.head_dim;
         let kv_dim = meta.n_kv_heads * meta.head_dim;
 
-        if let Some(wq) = w.get(&format!("blk.{l}.attn_q.weight")) {
-            dequant_and_gemm(ctx, pipes, act_out, wq, act_q, 1, q_dim, embed_dim);
-        }
-        if let Some(wk) = w.get(&format!("blk.{l}.attn_k.weight")) {
-            dequant_and_gemm(ctx, pipes, act_out, wk, act_k, 1, kv_dim, embed_dim);
-        }
-        if let Some(wv) = w.get(&format!("blk.{l}.attn_v.weight")) {
-            dequant_and_gemm(ctx, pipes, act_out, wv, act_v, 1, kv_dim, embed_dim);
+        if let Some(fused) = w.get(&format!("blk.{l}.attn_qkv.weight")) {
+            let qkv_dim = q_dim + 2 * kv_dim;
+            let act_qkv = ctx.create_storage_buffer("act_qkv", (qkv_dim * 4) as u64);
+            dequant_and_gemm(ctx, pipes, act_out, fused, &act_qkv, 1, qkv_dim, embed_dim);
+            // Apply fused QKV bias if present.
+            if let Some(b) = w.get(&format!("blk.{l}.attn_qkv.bias")) {
+                dispatch_bias_add(ctx, pipes, &act_qkv, b, qkv_dim);
+            }
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&act_qkv, 0,                                    act_q, 0, (q_dim  * 4) as u64);
+            enc.copy_buffer_to_buffer(&act_qkv, (q_dim * 4) as u64,                  act_k, 0, (kv_dim * 4) as u64);
+            enc.copy_buffer_to_buffer(&act_qkv, ((q_dim + kv_dim) * 4) as u64,       act_v, 0, (kv_dim * 4) as u64);
+            ctx.queue.submit([enc.finish()]);
+        } else {
+            if let Some(wq) = w.get(&format!("blk.{l}.attn_q.weight")) {
+                dequant_and_gemm(ctx, pipes, act_out, wq, act_q, 1, q_dim, embed_dim);
+                if let Some(b) = w.get(&format!("blk.{l}.attn_q.bias")) {
+                    dispatch_bias_add(ctx, pipes, act_q, b, q_dim);
+                }
+            }
+            if let Some(wk) = w.get(&format!("blk.{l}.attn_k.weight")) {
+                dequant_and_gemm(ctx, pipes, act_out, wk, act_k, 1, kv_dim, embed_dim);
+                if let Some(b) = w.get(&format!("blk.{l}.attn_k.bias")) {
+                    dispatch_bias_add(ctx, pipes, act_k, b, kv_dim);
+                }
+            }
+            if let Some(wv) = w.get(&format!("blk.{l}.attn_v.weight")) {
+                dequant_and_gemm(ctx, pipes, act_out, wv, act_v, 1, kv_dim, embed_dim);
+                if let Some(b) = w.get(&format!("blk.{l}.attn_v.bias")) {
+                    dispatch_bias_add(ctx, pipes, act_v, b, kv_dim);
+                }
+            }
         }
 
         // RoPE on Q and K.
-        dispatch_rope(ctx, pipes, act_q, meta.n_heads, meta.head_dim, pos, meta.rope_freq_base);
-        dispatch_rope(ctx, pipes, act_k, meta.n_kv_heads, meta.head_dim, pos, meta.rope_freq_base);
+        dispatch_rope(ctx, pipes, act_q, meta.n_heads, meta.head_dim, pos, meta.rope_freq_base, meta.rope_scale_factor);
+        dispatch_rope(ctx, pipes, act_k, meta.n_kv_heads, meta.head_dim, pos, meta.rope_freq_base, meta.rope_scale_factor);
 
         // Write K, V into this layer's cache slot at position `pos`.
         let kv_row_bytes = (kv_dim * 4) as u64;
@@ -351,36 +416,50 @@ fn run_forward_pass(
             1, kv_len, meta.n_heads, meta.n_kv_heads, meta.head_dim, pos,
         );
 
-        // Attention output projection.
+        // Attention output projection (+ optional bias).
         if let Some(wo) = w.get(&format!("blk.{l}.attn_output.weight")) {
             dequant_and_gemm(ctx, pipes, act_out, wo, act_x, 1, embed_dim, embed_dim);
+            if let Some(b) = w.get(&format!("blk.{l}.attn_output.bias")) {
+                dispatch_bias_add(ctx, pipes, act_x, b, embed_dim);
+            }
         }
 
         // RMS norm before FFN.
         if let Some(ffn_norm) = w.get(&format!("blk.{l}.ffn_norm.weight")) {
-            dispatch_rms_norm(ctx, pipes, act_x, ffn_norm, act_out, 1, embed_dim);
+            dispatch_rms_norm(ctx, pipes, act_x, &ffn_norm.buffer, act_out, 1, embed_dim, eps);
         }
 
-        // Feed-forward (SwiGLU).
-        let ffn_dim = meta.ffn_hidden_size;
-        if let (Some(w_gate), Some(w_up), Some(w_down)) = (
-            w.get(&format!("blk.{l}.ffn_gate.weight")),
-            w.get(&format!("blk.{l}.ffn_up.weight")),
-            w.get(&format!("blk.{l}.ffn_down.weight")),
-        ) {
-            dequant_and_gemm(ctx, pipes, act_out, w_gate, act_gate, 1, ffn_dim, embed_dim);
-            dequant_and_gemm(ctx, pipes, act_out, w_up,   act_up,   1, ffn_dim, embed_dim);
-            dispatch_silu(ctx, pipes, act_gate, act_up, ffn_dim);
-            dequant_and_gemm(ctx, pipes, act_gate, w_down, act_x,   1, embed_dim, ffn_dim);
+        // Feed-forward: MoE layers use a router + expert dispatch;
+        // dense layers use a single gate/up/down triple.
+        let has_moe_router = w.contains_key(&format!("blk.{l}.ffn_gate_inp.weight"));
+        if meta.n_experts > 0 && has_moe_router {
+            if let Some(moe_buf) = moe_out {
+                ffn_moe(ctx, pipes, w, meta, layer, act_out, act_gate, act_up, act_x, moe_buf);
+            }
+        } else {
+            let ffn_dim = meta.ffn_hidden_size;
+            if let (Some(w_gate), Some(w_up), Some(w_down)) = (
+                w.get(&format!("blk.{l}.ffn_gate.weight")),
+                w.get(&format!("blk.{l}.ffn_up.weight")),
+                w.get(&format!("blk.{l}.ffn_down.weight")),
+            ) {
+                dequant_and_gemm(ctx, pipes, act_out, w_gate, act_gate, 1, ffn_dim, embed_dim);
+                dequant_and_gemm(ctx, pipes, act_out, w_up,   act_up,   1, ffn_dim, embed_dim);
+                match meta.ffn_activation {
+                    FfnActivation::SwiGLU => dispatch_silu(ctx, pipes, act_gate, act_up, ffn_dim),
+                    FfnActivation::GEGLU  => dispatch_geglu(ctx, pipes, act_gate, act_up, ffn_dim),
+                }
+                dequant_and_gemm(ctx, pipes, act_gate, w_down, act_x, 1, embed_dim, ffn_dim);
+            }
         }
     }
 
     // 3. Final RMS norm + LM head → logits.
-    if let (Some(output_norm), Some(lm_head)) = (
-        w.get("output_norm.weight"),
-        w.get("output.weight"),
-    ) {
-        dispatch_rms_norm(ctx, pipes, act_x, output_norm, act_out, 1, embed_dim);
+    // Gemma ties output.weight to token_embd.weight; fall back when the former is absent.
+    let lm_head = w.get("output.weight")
+        .or_else(|| if meta.tied_embeddings { w.get("token_embd.weight") } else { None });
+    if let (Some(output_norm), Some(lm_head)) = (w.get("output_norm.weight"), lm_head) {
+        dispatch_rms_norm(ctx, pipes, act_x, &output_norm.buffer, act_out, 1, embed_dim, eps);
         dequant_and_gemm(ctx, pipes, act_out, lm_head, logit_buf, 1, meta.vocab_size, embed_dim);
     }
 
@@ -405,7 +484,7 @@ struct RmsNormParams { n_rows: u32, dim: u32, eps: f32, _pad: u32 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct RopeParams { n_heads: u32, head_dim: u32, seq_offset: u32, freq_base: f32 }
+struct RopeParams { n_heads: u32, head_dim: u32, seq_offset: u32, freq_base: f32, rope_scale: f32, _pad: u32 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -430,12 +509,34 @@ struct SiluParams { n_elements: u32, _pad: [u32; 3] }
 
 fn dequantize_tensor(
     ctx: &GpuContext, pipes: &WgpuPipelines,
-    quant: &wgpu::Buffer, out: &wgpu::Buffer, n_elements: usize,
+    quant: &GpuTensor, out: &wgpu::Buffer, n_elements: usize,
 ) {
+    // F32 tensors are already in the target format — copy bytes directly.
+    if quant.dtype == GgmlDType::F32 {
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&quant.buffer, 0, out, 0, (n_elements * 4) as u64);
+        ctx.queue.submit([enc.finish()]);
+        return;
+    }
+
+    let pipeline = match quant.dtype {
+        GgmlDType::Q4K  => &pipes.dequant_q4k,
+        GgmlDType::Q4_0 => &pipes.dequant_q4_0,
+        GgmlDType::Q5_0 => &pipes.dequant_q5_0,
+        GgmlDType::Q5_1 => &pipes.dequant_q5_1,
+        GgmlDType::Q5K  => &pipes.dequant_q5k,
+        GgmlDType::Q6K  => &pipes.dequant_q6k,
+        GgmlDType::Q2K  => &pipes.dequant_q2k,
+        GgmlDType::Q3K  => &pipes.dequant_q3k,
+        GgmlDType::F16  => &pipes.dequant_f16,
+        // Q8_0 and anything else (Q8_1, etc.) use the Q8 shader as best effort.
+        _               => &pipes.dequant_q8,
+    };
+
     let p = DequantParams { n_elements: n_elements as u32, _pad: [0; 3] };
     dispatch(
-        ctx, &pipes.dequant_q8,
-        &[BindingEntry { binding: 0, buffer: quant }, BindingEntry { binding: 1, buffer: out }],
+        ctx, pipeline,
+        &[BindingEntry { binding: 0, buffer: &quant.buffer }, BindingEntry { binding: 1, buffer: out }],
         Some(&p),
         (n_elements as u32 + 255) / 256, 1, 1,
     );
@@ -443,7 +544,7 @@ fn dequantize_tensor(
 
 fn dequant_and_gemm(
     ctx: &GpuContext, pipes: &WgpuPipelines,
-    input: &wgpu::Buffer, weight_q: &wgpu::Buffer, output: &wgpu::Buffer,
+    input: &wgpu::Buffer, weight_q: &GpuTensor, output: &wgpu::Buffer,
     m: usize, n: usize, k: usize,
 ) {
     let weight_f32 = ctx.create_storage_buffer("weight_f32", (n * k * 4) as u64);
@@ -467,9 +568,9 @@ fn dequant_and_gemm(
 fn dispatch_rms_norm(
     ctx: &GpuContext, pipes: &WgpuPipelines,
     input: &wgpu::Buffer, weight: &wgpu::Buffer, output: &wgpu::Buffer,
-    n_rows: usize, dim: usize,
+    n_rows: usize, dim: usize, eps: f32,
 ) {
-    let p = RmsNormParams { n_rows: n_rows as u32, dim: dim as u32, eps: 1e-5, _pad: 0 };
+    let p = RmsNormParams { n_rows: n_rows as u32, dim: dim as u32, eps, _pad: 0 };
     dispatch(
         ctx, &pipes.rms_norm,
         &[
@@ -484,11 +585,11 @@ fn dispatch_rms_norm(
 
 fn dispatch_rope(
     ctx: &GpuContext, pipes: &WgpuPipelines,
-    qk: &wgpu::Buffer, n_heads: usize, head_dim: usize, pos: usize, freq_base: f32,
+    qk: &wgpu::Buffer, n_heads: usize, head_dim: usize, pos: usize, freq_base: f32, rope_scale: f32,
 ) {
     let p = RopeParams {
         n_heads: n_heads as u32, head_dim: head_dim as u32,
-        seq_offset: pos as u32, freq_base,
+        seq_offset: pos as u32, freq_base, rope_scale, _pad: 0,
     };
     let n_pairs = n_heads * head_dim / 2;
     dispatch(
@@ -496,6 +597,28 @@ fn dispatch_rope(
         &[BindingEntry { binding: 0, buffer: qk }],
         Some(&p),
         (n_pairs as u32 + 63) / 64, 1, 1,
+    );
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BiasAddParams { n: u32, _pad: [u32; 3] }
+
+fn dispatch_bias_add(
+    ctx: &GpuContext, pipes: &WgpuPipelines,
+    output: &wgpu::Buffer, bias_q: &GpuTensor, n: usize,
+) {
+    let bias_f32 = ctx.create_storage_buffer("bias_f32", (n * 4) as u64);
+    dequantize_tensor(ctx, pipes, bias_q, &bias_f32, n);
+    let p = BiasAddParams { n: n as u32, _pad: [0; 3] };
+    dispatch(
+        ctx, &pipes.bias_add,
+        &[
+            BindingEntry { binding: 0, buffer: output },
+            BindingEntry { binding: 1, buffer: &bias_f32 },
+        ],
+        Some(&p),
+        (n as u32 + 255) / 256, 1, 1,
     );
 }
 
@@ -568,6 +691,128 @@ fn dispatch_silu(
         Some(&p),
         (n as u32 + 255) / 256, 1, 1,
     );
+}
+
+fn dispatch_geglu(
+    ctx: &GpuContext, pipes: &WgpuPipelines,
+    gate: &wgpu::Buffer, up: &wgpu::Buffer, n: usize,
+) {
+    let p = SiluParams { n_elements: n as u32, _pad: [0; 3] };
+    dispatch(
+        ctx, &pipes.geglu,
+        &[
+            BindingEntry { binding: 0, buffer: gate },
+            BindingEntry { binding: 1, buffer: up },
+        ],
+        Some(&p),
+        (n as u32 + 255) / 256, 1, 1,
+    );
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AccumParams { n: u32, scale: f32, _pad0: u32, _pad1: u32 }
+
+fn dispatch_accumulate(
+    ctx: &GpuContext, pipes: &WgpuPipelines,
+    acc: &wgpu::Buffer, src: &wgpu::Buffer, n: usize, scale: f32,
+) {
+    let p = AccumParams { n: n as u32, scale, _pad0: 0, _pad1: 0 };
+    dispatch(
+        ctx, &pipes.accumulate,
+        &[
+            BindingEntry { binding: 0, buffer: acc },
+            BindingEntry { binding: 1, buffer: src },
+        ],
+        Some(&p),
+        (n as u32 + 255) / 256, 1, 1,
+    );
+}
+
+/// Select top-K experts from raw router logits and return (expert_index, softmax_weight) pairs.
+fn topk_softmax(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let k = k.min(logits.len());
+    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.truncate(k);
+    let max_l = indexed.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f32 = indexed.iter().map(|(_, l)| (l - max_l).exp()).sum();
+    indexed.iter().map(|(idx, l)| (*idx, (l - max_l).exp() / exp_sum)).collect()
+}
+
+/// MoE FFN: route one token through top-K experts, accumulate weighted outputs, then
+/// add always-on shared expert(s) if the model has them (DeepSeek V2/V3, MiMo, etc.).
+#[allow(clippy::too_many_arguments)]
+fn ffn_moe(
+    ctx: &GpuContext,
+    pipes: &WgpuPipelines,
+    w: &HashMap<String, GpuTensor>,
+    meta: &GgufMeta,
+    layer: usize,
+    act_out: &wgpu::Buffer,   // normed activation (input to router and expert gate/up)
+    act_gate: &wgpu::Buffer,  // scratch: expert gate projection
+    act_up: &wgpu::Buffer,    // scratch: expert up projection
+    act_x: &wgpu::Buffer,     // scratch: expert down projection output
+    moe_out: &wgpu::Buffer,   // accumulation target (embed_dim f32)
+) {
+    let l = layer.to_string();
+    let embed_dim = meta.n_heads * meta.head_dim;
+    let ffn_dim = meta.expert_ffn_hidden_size;
+
+    // Router: project normed activation → (1 × n_experts) logits.
+    let router_buf = ctx.create_storage_buffer("router", (meta.n_experts * 4) as u64);
+    if let Some(router_w) = w.get(&format!("blk.{l}.ffn_gate_inp.weight")) {
+        dequant_and_gemm(ctx, pipes, act_out, router_w, &router_buf, 1, meta.n_experts, embed_dim);
+    }
+
+    // Readback to CPU, pick top-K, compute softmax weights.
+    let router_logits = readback_f32(ctx, &router_buf, meta.n_experts);
+    let selected = topk_softmax(&router_logits, meta.n_experts_used);
+
+    // Zero the accumulation buffer before adding expert contributions.
+    ctx.queue.write_buffer(moe_out, 0, &vec![0u8; embed_dim * 4]);
+
+    // Run each selected expert and accumulate score-weighted output.
+    for (expert_idx, score) in &selected {
+        let e = expert_idx;
+        let (Some(gate_w), Some(up_w), Some(down_w)) = (
+            w.get(&format!("blk.{l}.ffn_gate_exps.weight[{e}]")),
+            w.get(&format!("blk.{l}.ffn_up_exps.weight[{e}]")),
+            w.get(&format!("blk.{l}.ffn_down_exps.weight[{e}]")),
+        ) else {
+            continue;
+        };
+
+        dequant_and_gemm(ctx, pipes, act_out, gate_w, act_gate, 1, ffn_dim, embed_dim);
+        dequant_and_gemm(ctx, pipes, act_out, up_w,   act_up,   1, ffn_dim, embed_dim);
+        match meta.ffn_activation {
+            FfnActivation::SwiGLU => dispatch_silu(ctx, pipes, act_gate, act_up, ffn_dim),
+            FfnActivation::GEGLU  => dispatch_geglu(ctx, pipes, act_gate, act_up, ffn_dim),
+        }
+        dequant_and_gemm(ctx, pipes, act_gate, down_w, act_x, 1, embed_dim, ffn_dim);
+        dispatch_accumulate(ctx, pipes, moe_out, act_x, embed_dim, *score);
+    }
+
+    // Shared expert(s) — always active, not subject to routing (DeepSeek V2/V3, MiMo, etc.).
+    if let (Some(shg), Some(shu), Some(shd)) = (
+        w.get(&format!("blk.{l}.ffn_gate_shexp.weight")),
+        w.get(&format!("blk.{l}.ffn_up_shexp.weight")),
+        w.get(&format!("blk.{l}.ffn_down_shexp.weight")),
+    ) {
+        dequant_and_gemm(ctx, pipes, act_out, shg, act_gate, 1, ffn_dim, embed_dim);
+        dequant_and_gemm(ctx, pipes, act_out, shu, act_up,   1, ffn_dim, embed_dim);
+        match meta.ffn_activation {
+            FfnActivation::SwiGLU => dispatch_silu(ctx, pipes, act_gate, act_up, ffn_dim),
+            FfnActivation::GEGLU  => dispatch_geglu(ctx, pipes, act_gate, act_up, ffn_dim),
+        }
+        dequant_and_gemm(ctx, pipes, act_gate, shd, act_x, 1, embed_dim, ffn_dim);
+        dispatch_accumulate(ctx, pipes, moe_out, act_x, embed_dim, 1.0);
+    }
+
+    // Copy accumulated MoE result into act_x (feeds into the next layer's residual).
+    let mut enc = ctx.device.create_command_encoder(&Default::default());
+    enc.copy_buffer_to_buffer(moe_out, 0, act_x, 0, (embed_dim * 4) as u64);
+    ctx.queue.submit([enc.finish()]);
 }
 
 // ── Token sampling (CPU-side) ─────────────────────────────────────────────────

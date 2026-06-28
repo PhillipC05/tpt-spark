@@ -9,8 +9,10 @@ pub struct GpuContext {
     pub queue: Queue,
     pub adapter_info: wgpu::AdapterInfo,
     /// True when the adapter supports native f16 shader ops (shader_f16 feature).
+    #[allow(dead_code)]
     pub f16_supported: bool,
     /// Usable VRAM ceiling from adapter limits (bytes). 0 = unknown.
+    #[allow(dead_code)]
     pub max_buf_bytes: u64,
 }
 
@@ -63,12 +65,22 @@ impl GpuContext {
             required_features |= Features::SHADER_F16;
         }
 
+        // Request the adapter's actual limits so large tensor buffers (>128 MB) are allowed.
+        // Limits::default() caps max_storage_buffer_binding_size at 128 MB and
+        // max_buffer_size at 256 MB, which is too small for embedding tables and
+        // large-vocab or F16 weights.
+        let required_limits = Limits {
+            max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+            max_buffer_size: limits.max_buffer_size,
+            ..Limits::default()
+        };
+
         let (device, queue) = adapter
             .request_device(
                 &DeviceDescriptor {
                     label: Some("tpt-spark"),
                     required_features,
-                    required_limits: Limits::default(),
+                    required_limits,
                 },
                 None,
             )
@@ -81,16 +93,6 @@ impl GpuContext {
             adapter_info,
             f16_supported,
             max_buf_bytes,
-        })
-    }
-
-    /// Convenience: create a GPU-side storage buffer pre-populated with `data`.
-    pub fn upload_buffer(&self, label: &str, data: &[u8]) -> wgpu::Buffer {
-        use wgpu::util::DeviceExt;
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: data,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         })
     }
 

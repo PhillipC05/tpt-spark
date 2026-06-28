@@ -15,8 +15,8 @@ export default defineConfig({
     // Targeting esnext skips all downgrade transforms and eliminates polyfills.
     target: "esnext",
 
-    // esbuild (default) is fast enough; no need for terser.
-    minify: "esbuild",
+    // Vite 8 uses oxc (via rolldown) — esbuild is no longer bundled.
+    minify: "oxc",
     cssMinify: true,
 
     // Keep source maps out of the production bundle.
@@ -29,8 +29,8 @@ export default defineConfig({
       output: {
         // Isolate the Tauri IPC runtime so it can be fingerprint-cached
         // independently of application code when the app grows.
-        manualChunks: {
-          "tauri-api": ["@tauri-apps/api"],
+        manualChunks: (id) => {
+          if (id.includes("@tauri-apps/api")) return "tauri-api";
         },
       },
       // Tauri bundles everything into a self-contained WebView, so there are
