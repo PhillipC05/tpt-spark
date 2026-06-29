@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
@@ -24,7 +25,7 @@ use crate::engine::wgpu_kvcache::KvCache;
 use candle_core::quantized::GgmlDType;
 
 use crate::engine::wgpu_loader::{load_gguf_to_vram, FfnActivation, GgufMeta, GpuTensor, LoadedWeights};
-use crate::engine::wgpu_ops::{dispatch, readback_f32, BindingEntry, WgpuPipelines};
+use crate::engine::wgpu_ops::{append_dispatch, dispatch, readback_f32, BindingEntry, WgpuPipelines};
 use crate::engine::{InferenceParams, LlmEngine, ModelInfo, TokenEvent};
 
 // ── Top-level engine ───────────────────────────────────────────────────────────
@@ -167,12 +168,15 @@ fn gpu_infer(
     on_token: &mut dyn FnMut(TokenEvent) -> Result<()>,
 ) -> Result<()> {
     let meta = &m.weights.meta;
+    let t_total = Instant::now();
 
     // Tokenize.
+    let t_tok = Instant::now();
     let encoding = m.tokenizer
         .encode(params.prompt.as_str(), true)
         .map_err(|e| anyhow::anyhow!("tokenize: {}", e))?;
     let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let tokenize_ms = t_tok.elapsed().as_millis() as u64;
 
     // SAFETY: `infer` is called with `m: &GpuModel` rather than `&mut GpuModel` because the
     // LlmEngine trait requires `&self`.  The exclusive access invariant is upheld by the
@@ -243,6 +247,9 @@ fn gpu_infer(
 
     // Prefill: only run positions [prefix_len..prompt_len) — the earlier positions
     // already have valid K/V entries from the previous turn.
+    // t_prefill starts here and runs through the first GPU readback so it captures
+    // embedding dequant + all prefill forward passes + GPU pipeline flush.
+    let t_prefill = Instant::now();
     let prompt_len = tokens.len();
     for pos in prefix_len..prompt_len {
         run_forward_pass(
@@ -262,12 +269,16 @@ fn gpu_infer(
     kv_cache.cached_tokens = tokens.clone();
 
     // Sample first token from prefill logits.
+    // readback_f32 blocks (device.poll Wait) — this is the GPU sync point that
+    // makes t_prefill an accurate wall-clock measurement of the prefill phase.
     let logit_vec = readback_f32(&m.ctx, &logit_buf, meta.vocab_size);
+    let prefill_ms = t_prefill.elapsed().as_millis() as u64;
     let mut next_token = sample_token(&mut logits_proc, &logit_vec, &tokens, params.repeat_penalty)?;
 
     // Autoregressive decode.
     let mut pos = prompt_len;
     let mut generated: usize = 0;
+    let t_decode = Instant::now();
 
     loop {
         if next_token == m.eos_token_id { break; }
@@ -306,6 +317,17 @@ fn gpu_infer(
         pos += 1;
     }
 
+    let decode_ms = t_decode.elapsed().as_millis() as u64;
+    let total_ms  = t_total.elapsed().as_millis() as u64;
+
+    info!(
+        "Timing: tokenize={}ms  prefill={}ms ({} pos)  decode={}ms ({} tok, {:.1}ms/tok avg)  total={}ms",
+        tokenize_ms,
+        prefill_ms, prompt_len.saturating_sub(prefix_len),
+        decode_ms, generated,
+        if generated > 0 { decode_ms as f64 / generated as f64 } else { 0.0 },
+        total_ms,
+    );
     info!("GPU inference complete: {} tokens generated", generated);
     on_token(TokenEvent { token: String::new(), done: true })?;
     Ok(())
@@ -507,19 +529,9 @@ struct AttnOutParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SiluParams { n_elements: u32, _pad: [u32; 3] }
 
-fn dequantize_tensor(
-    ctx: &GpuContext, pipes: &WgpuPipelines,
-    quant: &GpuTensor, out: &wgpu::Buffer, n_elements: usize,
-) {
-    // F32 tensors are already in the target format — copy bytes directly.
-    if quant.dtype == GgmlDType::F32 {
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(&quant.buffer, 0, out, 0, (n_elements * 4) as u64);
-        ctx.queue.submit([enc.finish()]);
-        return;
-    }
-
-    let pipeline = match quant.dtype {
+/// Select the dequantisation pipeline for a given GGML dtype.
+fn dequant_pipeline<'a>(pipes: &'a WgpuPipelines, dtype: GgmlDType) -> &'a wgpu::ComputePipeline {
+    match dtype {
         GgmlDType::Q4K  => &pipes.dequant_q4k,
         GgmlDType::Q4_0 => &pipes.dequant_q4_0,
         GgmlDType::Q5_0 => &pipes.dequant_q5_0,
@@ -529,17 +541,41 @@ fn dequantize_tensor(
         GgmlDType::Q2K  => &pipes.dequant_q2k,
         GgmlDType::Q3K  => &pipes.dequant_q3k,
         GgmlDType::F16  => &pipes.dequant_f16,
-        // Q8_0 and anything else (Q8_1, etc.) use the Q8 shader as best effort.
         _               => &pipes.dequant_q8,
-    };
+    }
+}
 
+/// Append a dequantisation pass to `encoder` without submitting.
+/// F32 tensors are handled with a buffer copy; all other dtypes dispatch
+/// the appropriate dequant shader.
+fn append_dequant(
+    encoder: &mut wgpu::CommandEncoder,
+    device: &wgpu::Device,
+    pipes: &WgpuPipelines,
+    quant: &GpuTensor,
+    out: &wgpu::Buffer,
+    n_elements: usize,
+) {
+    if quant.dtype == GgmlDType::F32 {
+        encoder.copy_buffer_to_buffer(&quant.buffer, 0, out, 0, (n_elements * 4) as u64);
+        return;
+    }
     let p = DequantParams { n_elements: n_elements as u32, _pad: [0; 3] };
-    dispatch(
-        ctx, pipeline,
+    append_dispatch(
+        encoder, device, dequant_pipeline(pipes, quant.dtype),
         &[BindingEntry { binding: 0, buffer: &quant.buffer }, BindingEntry { binding: 1, buffer: out }],
         Some(&p),
         (n_elements as u32 + 255) / 256, 1, 1,
     );
+}
+
+fn dequantize_tensor(
+    ctx: &GpuContext, pipes: &WgpuPipelines,
+    quant: &GpuTensor, out: &wgpu::Buffer, n_elements: usize,
+) {
+    let mut enc = ctx.device.create_command_encoder(&Default::default());
+    append_dequant(&mut enc, &ctx.device, pipes, quant, out, n_elements);
+    ctx.queue.submit([enc.finish()]);
 }
 
 fn dequant_and_gemm(
@@ -547,22 +583,25 @@ fn dequant_and_gemm(
     input: &wgpu::Buffer, weight_q: &GpuTensor, output: &wgpu::Buffer,
     m: usize, n: usize, k: usize,
 ) {
-    let weight_f32 = ctx.create_storage_buffer("weight_f32", (n * k * 4) as u64);
-    dequantize_tensor(ctx, pipes, weight_q, &weight_f32, n * k);
-
+    // Batch dequant + GEMM into one encoder → one queue.submit() instead of two.
+    // Between compute passes in the same encoder, WebGPU guarantees that writes
+    // from the dequant pass are visible to the GEMM pass (implicit barrier).
+    let weight_f32 = ctx.create_storage_buffer("w_f32", (n * k * 4) as u64);
+    let mut enc = ctx.device.create_command_encoder(&Default::default());
+    append_dequant(&mut enc, &ctx.device, pipes, weight_q, &weight_f32, n * k);
     let p = GemmDims { M: m as u32, N: n as u32, K: k as u32, _pad: 0 };
-    dispatch(
-        ctx, &pipes.gemm,
+    append_dispatch(
+        &mut enc, &ctx.device, &pipes.gemm,
         &[
             BindingEntry { binding: 0, buffer: input },
             BindingEntry { binding: 1, buffer: &weight_f32 },
             BindingEntry { binding: 2, buffer: output },
         ],
         Some(&p),
-        (n as u32 + 15) / 16,
-        (m as u32 + 15) / 16,
-        1,
+        (n as u32 + 15) / 16, (m as u32 + 15) / 16, 1,
     );
+    ctx.queue.submit([enc.finish()]);
+    // weight_f32 drops here; the submitted CommandBuffer holds the Arc refs.
 }
 
 fn dispatch_rms_norm(
@@ -609,10 +648,11 @@ fn dispatch_bias_add(
     output: &wgpu::Buffer, bias_q: &GpuTensor, n: usize,
 ) {
     let bias_f32 = ctx.create_storage_buffer("bias_f32", (n * 4) as u64);
-    dequantize_tensor(ctx, pipes, bias_q, &bias_f32, n);
+    let mut enc = ctx.device.create_command_encoder(&Default::default());
+    append_dequant(&mut enc, &ctx.device, pipes, bias_q, &bias_f32, n);
     let p = BiasAddParams { n: n as u32, _pad: [0; 3] };
-    dispatch(
-        ctx, &pipes.bias_add,
+    append_dispatch(
+        &mut enc, &ctx.device, &pipes.bias_add,
         &[
             BindingEntry { binding: 0, buffer: output },
             BindingEntry { binding: 1, buffer: &bias_f32 },
@@ -620,6 +660,7 @@ fn dispatch_bias_add(
         Some(&p),
         (n as u32 + 255) / 256, 1, 1,
     );
+    ctx.queue.submit([enc.finish()]);
 }
 
 fn dispatch_attention(
@@ -629,52 +670,59 @@ fn dispatch_attention(
     seq_len: usize, kv_len: usize,
     n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_offset: usize,
 ) {
+    // Batch all three attention passes into one encoder → one queue.submit().
+    // WebGPU guarantees storage-buffer write visibility between consecutive
+    // compute passes in the same encoder (scores is written by pass 1,
+    // in-place updated by pass 2, then read by pass 3).
+    let mut enc = ctx.device.create_command_encoder(&Default::default());
+
+    // Pass 1: QK^T / sqrt(head_dim) with causal mask → scores buffer.
     let score_p = AttnScoreParams {
         seq_len: seq_len as u32, kv_len: kv_len as u32,
         n_heads: n_heads as u32, n_kv_heads: n_kv_heads as u32,
         head_dim: head_dim as u32, seq_offset: seq_offset as u32,
     };
-    dispatch(
-        ctx, &pipes.attn_scores,
+    append_dispatch(
+        &mut enc, &ctx.device, &pipes.attn_scores,
         &[
             BindingEntry { binding: 0, buffer: q },
             BindingEntry { binding: 1, buffer: k },
             BindingEntry { binding: 2, buffer: scores },
         ],
         Some(&score_p),
-        (kv_len as u32 + 63) / 64,
-        seq_len as u32,
-        n_heads as u32,
+        (kv_len as u32 + 63) / 64, seq_len as u32, n_heads as u32,
     );
 
+    // Pass 2: numerically stable softmax over scores (in-place).
     let sm_p = AttnSoftmaxParams {
         seq_len: seq_len as u32, kv_len: kv_len as u32,
         n_heads: n_heads as u32, _pad: 0,
     };
-    dispatch(
-        ctx, &pipes.attn_softmax,
+    append_dispatch(
+        &mut enc, &ctx.device, &pipes.attn_softmax,
         &[BindingEntry { binding: 0, buffer: scores }],
         Some(&sm_p),
         (seq_len * n_heads) as u32, 1, 1,
     );
 
+    // Pass 3: weighted sum of V → output.
     let out_p = AttnOutParams {
         seq_len: seq_len as u32, kv_len: kv_len as u32,
         n_heads: n_heads as u32, n_kv_heads: n_kv_heads as u32,
         head_dim: head_dim as u32, _pad: 0,
     };
-    dispatch(
-        ctx, &pipes.attn_output,
+    append_dispatch(
+        &mut enc, &ctx.device, &pipes.attn_output,
         &[
             BindingEntry { binding: 0, buffer: scores },
             BindingEntry { binding: 1, buffer: v },
             BindingEntry { binding: 2, buffer: output },
         ],
         Some(&out_p),
-        (head_dim as u32 + 63) / 64,
-        seq_len as u32,
-        n_heads as u32,
+        (head_dim as u32 + 63) / 64, seq_len as u32, n_heads as u32,
     );
+
+    ctx.queue.submit([enc.finish()]);
 }
 
 fn dispatch_silu(

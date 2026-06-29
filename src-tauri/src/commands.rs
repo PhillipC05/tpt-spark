@@ -2,7 +2,7 @@ use crate::conversation::{
     delete_conversation, list_conversations, load_conversation, save_conversation, Conversation,
 };
 use crate::engine::{EngineHandle, InferenceParams, ModelInfo};
-use crate::models::{scan_models_dir, ModelEntry};
+use crate::models::{save_models_json, scan_models_dir, ModelEntry};
 use anyhow::anyhow;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tauri::{ipc::Channel, State};
 use tracing::{error, info};
 
@@ -18,6 +19,7 @@ pub struct CancelFlag(pub Arc<AtomicBool>);
 pub struct ModelsDir(pub Mutex<PathBuf>);
 pub struct HistoryDir(pub PathBuf);
 pub struct ConfigPath(pub PathBuf);
+pub struct BenchmarksPath(pub PathBuf);
 
 // ── Model management ────────────────────────────────────────────────────────
 
@@ -101,6 +103,10 @@ pub async fn delete_model(
     }
     info!("Deleting model file: {}", path);
     fs::remove_file(&canonical).map_err(|e| format!("delete_model: {e}"))?;
+
+    // Refresh the shared models index.
+    save_models_json(&models_dir.0.lock().unwrap());
+
     Ok(())
 }
 
@@ -170,6 +176,10 @@ pub async fn download_model(
         .map_err(|e| format!("channel: {e}"))?;
 
     info!("Download complete: {} bytes → {}", downloaded, dest.display());
+
+    // Refresh the shared models index so other TPT tools see the new model.
+    save_models_json(&models_dir.0.lock().unwrap());
+
     Ok(())
 }
 
@@ -180,6 +190,12 @@ pub async fn download_model(
 pub struct StreamEvent {
     pub token: String,
     pub done: bool,
+    // Timing fields — only populated on the final done:true event, null otherwise.
+    pub tokens_generated: Option<u32>,
+    pub ttft_ms: Option<u64>,
+    pub prefill_ms: Option<u64>,
+    pub decode_ms: Option<u64>,
+    pub tokens_per_sec: Option<f64>,
 }
 
 #[tauri::command]
@@ -221,13 +237,51 @@ pub async fn run_inference(
 
     let cancel_flag = Arc::clone(&cancel.0);
     let result = tokio::task::block_in_place(|| {
+        let inference_start = Instant::now();
+        let mut ttft_ms: Option<u64> = None;
+        let mut prefill_end: Option<Instant> = None;
+        let mut tokens_generated: u32 = 0;
+
         eng.infer(&params, &mut |tok| {
             if cancel_flag.load(Ordering::Relaxed) {
                 anyhow::bail!("inference cancelled");
             }
-            channel
-                .send(StreamEvent { token: tok.token, done: tok.done })
-                .map_err(|e| anyhow!("channel send error: {}", e))
+
+            if !tok.done && ttft_ms.is_none() {
+                ttft_ms = Some(inference_start.elapsed().as_millis() as u64);
+                prefill_end = Some(Instant::now());
+            }
+            if !tok.done {
+                tokens_generated += 1;
+            }
+
+            let event = if tok.done {
+                let decode_ms = prefill_end.map(|pe| pe.elapsed().as_millis() as u64);
+                let tokens_per_sec = decode_ms
+                    .filter(|&d| d > 0)
+                    .map(|d| tokens_generated as f64 / (d as f64 / 1000.0));
+                StreamEvent {
+                    token: tok.token,
+                    done: true,
+                    tokens_generated: Some(tokens_generated),
+                    ttft_ms,
+                    prefill_ms: ttft_ms,
+                    decode_ms,
+                    tokens_per_sec,
+                }
+            } else {
+                StreamEvent {
+                    token: tok.token,
+                    done: false,
+                    tokens_generated: None,
+                    ttft_ms: None,
+                    prefill_ms: None,
+                    decode_ms: None,
+                    tokens_per_sec: None,
+                }
+            };
+
+            channel.send(event).map_err(|e| anyhow!("channel send error: {}", e))
         })
     });
 
@@ -313,6 +367,254 @@ pub async fn pick_models_dir(
         }
         None => Ok(None),
     }
+}
+
+// ── Benchmarks ───────────────────────────────────────────────────────────────
+
+const BENCHMARK_PROMPT: &str =
+    "Explain the difference between a stack and a heap in memory management. \
+     Be concise and use a simple analogy.";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkResult {
+    pub id: String,
+    pub model_name: String,
+    pub backend: String,
+    pub model_size_bytes: u64,
+    pub prompt_tokens: u32,
+    pub prompt_label: String,
+    pub tokens_generated: u32,
+    pub prefill_ms: u64,
+    pub decode_ms: u64,
+    pub total_ms: u64,
+    pub tokens_per_sec: f64,
+    pub toks_per_sec_per_gb: f64,
+    pub ttft_ms: u64,
+    pub timestamp: String,
+}
+
+fn load_benchmarks_file(path: &Path) -> Vec<BenchmarkResult> {
+    if !path.exists() {
+        return vec![];
+    }
+    match fs::read_to_string(path).and_then(|s| {
+        serde_json::from_str(&s)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }) {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::warn!("Failed to read benchmarks file: {}", e);
+            vec![]
+        }
+    }
+}
+
+fn save_benchmarks_file(path: &Path, results: &[BenchmarkResult]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(results)?)?;
+    Ok(())
+}
+
+fn append_benchmark_result(path: &Path, result: &BenchmarkResult) -> anyhow::Result<()> {
+    let mut results = load_benchmarks_file(path);
+    results.insert(0, result.clone());
+    save_benchmarks_file(path, &results)
+}
+
+// ── Crucible benchmark export ─────────────────────────────────────────────────
+
+/// Minimal schema read by tpt-crucible to validate compiled edge-target performance.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct CrucibleBenchmarkRecord<'a> {
+    model: &'a str,
+    tokens_per_second: f64,
+    time_to_first_token_ms: u64,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    engine: &'a str,
+    gpu_name: String,
+    timestamp: &'a str,
+}
+
+fn write_crucible_benchmark(result: &BenchmarkResult) {
+    let benchmarks_dir = dirs_next::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".tpt")
+        .join("benchmarks");
+
+    if let Err(e) = fs::create_dir_all(&benchmarks_dir) {
+        tracing::warn!("Crucible benchmark dir: {e}");
+        return;
+    }
+
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let path = benchmarks_dir.join(format!("spark-{date}.json"));
+
+    let gpu_name = if result.backend.contains("wgpu") || result.backend.contains("tpt-gpu") {
+        // Try to read GPU name from wgpu context; fall back to backend string.
+        result.backend.clone()
+    } else {
+        "cpu".to_string()
+    };
+
+    let record = CrucibleBenchmarkRecord {
+        model: &result.model_name,
+        tokens_per_second: result.tokens_per_sec,
+        time_to_first_token_ms: result.ttft_ms,
+        prompt_tokens: result.prompt_tokens,
+        completion_tokens: result.tokens_generated,
+        engine: &result.backend,
+        gpu_name,
+        timestamp: &result.timestamp,
+    };
+
+    match serde_json::to_string_pretty(&record) {
+        Ok(json) => {
+            if let Err(e) = fs::write(&path, json) {
+                tracing::warn!("Failed to write Crucible benchmark: {e}");
+            } else {
+                info!("Crucible benchmark written → {}", path.display());
+            }
+        }
+        Err(e) => tracing::warn!("Crucible benchmark serialisation: {e}"),
+    }
+}
+
+#[tauri::command]
+pub async fn run_benchmark(
+    max_tokens: u32,
+    custom_prompt: Option<String>,
+    engine: State<'_, EngineHandle>,
+    benchmarks_path: State<'_, BenchmarksPath>,
+) -> Result<BenchmarkResult, String> {
+    let eng = engine.lock().await;
+
+    if !eng.is_loaded() {
+        return Err("No model loaded. Load a model before running a benchmark.".to_string());
+    }
+
+    let model_info = eng.model_info().unwrap().clone();
+
+    let (prompt_text, prompt_label) = if let Some(ref cp) = custom_prompt {
+        let label = {
+            let chars: String = cp.chars().take(40).collect();
+            if cp.chars().count() > 40 { format!("{chars}…") } else { chars }
+        };
+        (cp.clone(), label)
+    } else {
+        let label = match max_tokens {
+            64  => "short-64".to_string(),
+            128 => "medium-128".to_string(),
+            256 => "long-256".to_string(),
+            n   => format!("custom-{n}"),
+        };
+        (BENCHMARK_PROMPT.to_string(), label)
+    };
+
+    let params = InferenceParams {
+        prompt: prompt_text.clone(),
+        system_prompt: None,
+        max_tokens,
+        temperature: 0.0,
+        top_p: 1.0,
+        repeat_penalty: 1.0,
+    };
+
+    info!(
+        "Benchmark starting: model={} backend={} max_tokens={}",
+        model_info.name, model_info.backend, max_tokens
+    );
+
+    let model_info_clone = model_info.clone();
+    let bpath = benchmarks_path.0.clone();
+
+    let result = tokio::task::block_in_place(|| {
+        // Warm-up pass — discard output, not timed.
+        info!("Benchmark warm-up pass");
+        eng.infer(&params, &mut |_| Ok(()))?;
+
+        // Timed pass.
+        info!("Benchmark timed pass");
+        let start = Instant::now();
+        let mut ttft_ms: u64 = 0;
+        let mut prefill_end: Option<Instant> = None;
+        let mut tokens_generated: u32 = 0;
+
+        eng.infer(&params, &mut |tok| {
+            if !tok.done && prefill_end.is_none() {
+                ttft_ms = start.elapsed().as_millis() as u64;
+                prefill_end = Some(Instant::now());
+            }
+            if !tok.done {
+                tokens_generated += 1;
+            }
+            Ok(())
+        })?;
+
+        let total_ms = start.elapsed().as_millis() as u64;
+        let decode_ms = prefill_end.map(|pe| pe.elapsed().as_millis() as u64).unwrap_or(0);
+        let tokens_per_sec = if decode_ms > 0 {
+            tokens_generated as f64 / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        let model_size_gb = model_info_clone.size_bytes as f64 / 1_000_000_000.0;
+        let toks_per_sec_per_gb = if model_size_gb > 0.0 { tokens_per_sec / model_size_gb } else { 0.0 };
+
+        Ok::<BenchmarkResult, anyhow::Error>(BenchmarkResult {
+            id: uuid::Uuid::new_v4().to_string(),
+            model_name: model_info_clone.name.clone(),
+            backend: model_info_clone.backend.clone(),
+            model_size_bytes: model_info_clone.size_bytes,
+            prompt_tokens: (prompt_text.len() / 4) as u32,
+            prompt_label,
+            tokens_generated,
+            prefill_ms: ttft_ms,
+            decode_ms,
+            total_ms,
+            tokens_per_sec,
+            toks_per_sec_per_gb,
+            ttft_ms,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        })
+    });
+
+    match result {
+        Ok(r) => {
+            if let Err(e) = append_benchmark_result(&bpath, &r) {
+                tracing::warn!("Failed to save benchmark result: {}", e);
+            }
+            write_crucible_benchmark(&r);
+            info!("Benchmark complete: {:.1} tok/s", r.tokens_per_sec);
+            Ok(r)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn list_benchmarks(
+    benchmarks_path: State<'_, BenchmarksPath>,
+) -> Result<Vec<BenchmarkResult>, String> {
+    Ok(load_benchmarks_file(&benchmarks_path.0))
+}
+
+#[tauri::command]
+pub async fn delete_benchmark(
+    id: String,
+    benchmarks_path: State<'_, BenchmarksPath>,
+) -> Result<(), String> {
+    let mut results = load_benchmarks_file(&benchmarks_path.0);
+    let before = results.len();
+    results.retain(|r| r.id != id);
+    if results.len() < before {
+        save_benchmarks_file(&benchmarks_path.0, &results).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 // ── Shell helpers ─────────────────────────────────────────────────────────────

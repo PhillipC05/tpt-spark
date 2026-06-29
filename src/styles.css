@@ -198,6 +198,51 @@ body {
 .confirm-content p { margin-bottom: 16px; font-size: 14px; line-height: 1.5; }
 .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
+/* ── Inference stats bar ─────────────────────────────────────────────────── */
+.message-content { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; max-width: calc(100% - 44px); }
+.message-content .message-bubble { max-width: 100%; }
+
+.inference-stats { font-family: var(--font-mono); font-size: 10px; color: var(--text-2); letter-spacing: 0.02em; }
+.inference-stats.hidden { display: none; }
+
+/* ── Benchmark panel ──────────────────────────────────────────────────────── */
+.benchmark-panel { margin-top: 4px; display: flex; flex-direction: column; gap: 6px; }
+
+.bench-presets { display: flex; gap: 4px; flex-wrap: wrap; }
+.bench-preset.active { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
+
+.bench-custom-prompt { width: 100%; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-0); font-family: var(--font-sans); font-size: 12px; line-height: 1.5; padding: 6px 8px; resize: vertical; transition: border-color 0.15s; }
+.bench-custom-prompt:focus { outline: none; border-color: var(--accent); }
+.bench-custom-prompt::placeholder { color: var(--text-2); }
+.bench-custom-prompt.hidden { display: none; }
+
+.benchmark-status { font-size: 11px; color: var(--text-1); background: var(--bg-2); border-radius: var(--radius-sm); padding: 4px 8px; text-align: center; }
+.benchmark-status.hidden { display: none; }
+
+.bench-export { align-self: flex-end; }
+.bench-export.hidden { display: none; }
+
+.benchmark-results { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; }
+
+.benchmark-row { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; border-left: 3px solid transparent; }
+.benchmark-row.bench-best { border-left-color: var(--accent); }
+
+.bench-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 4px; margin-bottom: 6px; }
+.bench-model { font-size: 11px; color: var(--text-0); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.bench-header-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.bench-preset-badge { font-size: 9px; background: var(--bg-3); border: 1px solid var(--border); border-radius: 10px; padding: 1px 6px; color: var(--text-2); white-space: nowrap; }
+.bench-timestamp { font-size: 10px; color: var(--text-2); white-space: nowrap; }
+.bench-delete { background: none; border: none; color: var(--text-2); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }
+.bench-delete:hover { color: var(--red); }
+
+.bench-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 3px; margin-bottom: 4px; }
+.bench-metric { display: flex; flex-direction: column; align-items: center; background: var(--bg-3); border-radius: var(--radius-sm); padding: 4px 2px; }
+.bench-val { font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--accent); }
+.bench-best .bench-val { color: var(--accent); }
+.bench-label { font-size: 8px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 1px; text-align: center; }
+
+.bench-footer { font-size: 10px; color: var(--text-2); text-align: right; }
+
 /* ── Scrollbar ────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

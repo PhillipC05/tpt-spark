@@ -115,6 +115,28 @@
           </div>
         </section>
 
+        <!-- Benchmark -->
+        <section class="sidebar-section">
+          <div class="section-label-row">
+            <span class="section-label">Benchmark</span>
+            <button id="btn-toggle-benchmark" class="btn btn-ghost btn-xs">▸</button>
+          </div>
+          <div id="benchmark-panel" class="benchmark-panel hidden">
+            <p class="hint">Warm-up + timed pass · temp=0 · load a model first.</p>
+            <div class="bench-presets">
+              <button class="btn btn-ghost btn-xs bench-preset active" data-tokens="64">Short</button>
+              <button class="btn btn-ghost btn-xs bench-preset" data-tokens="128">Medium</button>
+              <button class="btn btn-ghost btn-xs bench-preset" data-tokens="256">Long</button>
+              <button class="btn btn-ghost btn-xs bench-preset" data-tokens="0">Custom</button>
+            </div>
+            <textarea id="bench-custom-prompt" class="bench-custom-prompt hidden" placeholder="Enter your benchmark prompt…" rows="3"></textarea>
+            <button id="btn-run-benchmark" class="btn btn-ghost btn-sm" style="width:100%;margin-top:6px" disabled>Run Benchmark</button>
+            <div id="benchmark-status" class="benchmark-status hidden"></div>
+            <button id="btn-copy-results" class="btn btn-ghost btn-xs bench-export hidden">Copy as Markdown</button>
+            <div id="benchmark-results" class="benchmark-results"></div>
+          </div>
+        </section>
+
         <div class="sidebar-footer">
           <div id="backend-badge" class="backend-badge">backend: stub</div>
         </div>

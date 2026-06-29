@@ -69,6 +69,12 @@ optional = true
 version  = "0.3"
 optional = true
 
+# tpt-gpu engine (tpt-gpu-runtime wraps the Layer 4 GPU kernel suite)
+# Uncomment once tpt-gpu-runtime 0.1 is published to crates.io:
+# [dependencies.tpt-gpu-runtime]
+# version  = "0.1"
+# optional = true
+
 # Feature flags
 [features]
 default       = ["engine-stub"]
@@ -77,3 +83,9 @@ engine-candle = ["candle-core", "candle-transformers", "tokenizers"]
 # engine-wgpu unions candle deps so the CPU fallback path is always available
 engine-wgpu   = ["wgpu", "bytemuck", "memmap2", "half", "pollster",
                   "candle-core", "candle-transformers", "tokenizers"]
+# engine-tpt-gpu wraps the tpt-gpu-runtime crate (Layer 4 GEMM / FlashAttention v2).
+# Uncomment the tpt-gpu-runtime dependency below once the crate is published.
+# Falls back through engine-wgpu → engine-candle when no suitable GPU is found.
+engine-tpt-gpu = []
+# Force a console window on Windows even in release builds (useful for headless server deployments).
+headless-console = []

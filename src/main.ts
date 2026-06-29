@@ -20,6 +20,28 @@ interface ModelInfo {
 interface StreamEvent {
   token: string;
   done: boolean;
+  tokensGenerated: number | null;
+  ttftMs: number | null;
+  prefillMs: number | null;
+  decodeMs: number | null;
+  tokensPerSec: number | null;
+}
+
+interface BenchmarkResult {
+  id: string;
+  modelName: string;
+  backend: string;
+  modelSizeBytes: number;
+  promptTokens: number;
+  promptLabel: string;
+  tokensGenerated: number;
+  prefillMs: number;
+  decodeMs: number;
+  totalMs: number;
+  tokensPerSec: number;
+  toksPerSecPerGb: number;
+  ttftMs: number;
+  timestamp: string;
 }
 
 interface DownloadProgress {
@@ -62,6 +84,8 @@ interface Conversation {
 let isGenerating = false;
 let currentConv: Conversation | null = null;
 let loadedModelName = "";
+let benchmarkResults: BenchmarkResult[] = [];
+let selectedBenchmarkTokens = 64;
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
@@ -115,6 +139,14 @@ const confirmText      = q<HTMLParagraphElement>("#confirm-text");
 const confirmOk        = q<HTMLButtonElement>("#confirm-ok");
 const confirmCancel    = q<HTMLButtonElement>("#confirm-cancel");
 
+const btnToggleBenchmark  = q<HTMLButtonElement>("#btn-toggle-benchmark");
+const benchmarkPanel      = q<HTMLDivElement>("#benchmark-panel");
+const benchCustomPrompt   = q<HTMLTextAreaElement>("#bench-custom-prompt");
+const btnRunBenchmark     = q<HTMLButtonElement>("#btn-run-benchmark");
+const benchmarkStatus     = q<HTMLDivElement>("#benchmark-status");
+const btnCopyResults      = q<HTMLButtonElement>("#btn-copy-results");
+const benchmarkResultsEl  = q<HTMLDivElement>("#benchmark-results");
+
 function q<T extends Element>(sel: string): T {
   return document.querySelector(sel) as T;
 }
@@ -158,6 +190,26 @@ async function init() {
   });
 
   confirmCancel.addEventListener("click", () => confirmDialog.close());
+
+  btnToggleBenchmark.addEventListener("click", () => togglePanel(benchmarkPanel, btnToggleBenchmark));
+  btnRunBenchmark.addEventListener("click", handleRunBenchmark);
+  btnCopyResults.addEventListener("click", handleCopyBenchmarkResults);
+
+  document.querySelectorAll<HTMLButtonElement>(".bench-preset").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".bench-preset").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      const tokens = parseInt(btn.dataset.tokens ?? "64", 10);
+      selectedBenchmarkTokens = tokens;
+      if (tokens === 0) {
+        benchCustomPrompt.classList.remove("hidden");
+      } else {
+        benchCustomPrompt.classList.add("hidden");
+      }
+    });
+  });
+
+  await loadBenchmarkHistory();
 }
 
 // ── System info ───────────────────────────────────────────────────────────────
@@ -332,6 +384,7 @@ function setModelUnloaded() {
 function enableChat() {
   promptInput.disabled = false;
   btnSend.disabled = false;
+  btnRunBenchmark.disabled = false;
   promptInput.placeholder = "Send a message… (Enter to send, Shift+Enter for newline)";
   promptInput.focus();
 }
@@ -339,6 +392,7 @@ function enableChat() {
 function disableChat() {
   promptInput.disabled = true;
   btnSend.disabled = true;
+  btnRunBenchmark.disabled = true;
   promptInput.placeholder = "Load a model to start chatting…";
 }
 
@@ -488,7 +542,7 @@ async function handleSend() {
 
   hideWelcome();
   appendUserMessage(userText);
-  const bubble = appendAssistantMessage();
+  const { bubble, statsBar } = appendAssistantMessage();
   setStatus("Generating…");
 
   // Build up the full conversation prompt from history.
@@ -500,6 +554,7 @@ async function handleSend() {
   channel.onmessage = (event) => {
     if (event.done) {
       bubble.classList.remove("streaming");
+      renderInferenceStats(statsBar, event);
       isGenerating = false;
       btnSend.disabled = false;
       btnStop.classList.add("hidden");
@@ -584,18 +639,32 @@ function appendUserMessage(text: string) {
   scrollToBottom();
 }
 
-function appendAssistantMessage(): HTMLDivElement {
+function appendAssistantMessage(): { bubble: HTMLDivElement; statsBar: HTMLDivElement } {
   const msg = document.createElement("div");
   msg.className = "message assistant";
+
+  const avatar = document.createElement("div");
+  avatar.className = "message-avatar";
+  avatar.textContent = "⚡";
+
+  const content = document.createElement("div");
+  content.className = "message-content";
+
   const bubble = document.createElement("div");
   bubble.className = "message-bubble streaming";
-  msg.innerHTML = `<div class="message-avatar">⚡</div>`;
-  msg.appendChild(bubble);
-  const copyBtn = makeCopyButton(() => bubble.textContent ?? "");
-  msg.appendChild(copyBtn);
+
+  const statsBar = document.createElement("div");
+  statsBar.className = "inference-stats hidden";
+
+  content.appendChild(bubble);
+  content.appendChild(statsBar);
+  msg.appendChild(avatar);
+  msg.appendChild(content);
+  msg.appendChild(makeCopyButton(() => bubble.textContent ?? ""));
+
   messagesEl.appendChild(msg);
   scrollToBottom();
-  return bubble;
+  return { bubble, statsBar };
 }
 
 function appendAssistantMessageStatic(text: string) {
@@ -635,6 +704,152 @@ function appendError(text: string) {
   el.innerHTML = `<div class="error-bubble">${escapeHtml(text)}</div>`;
   messagesEl.appendChild(el);
   scrollToBottom();
+}
+
+function renderInferenceStats(bar: HTMLDivElement, event: StreamEvent): void {
+  if (event.tokensGenerated === null) return;
+  const parts: string[] = [`${event.tokensGenerated} tok`];
+  if (event.tokensPerSec !== null) parts.push(`${event.tokensPerSec.toFixed(1)} tok/s`);
+  if (event.ttftMs !== null) parts.push(`TTFT ${event.ttftMs}ms`);
+  if (event.decodeMs !== null) parts.push(`decode ${event.decodeMs}ms`);
+  bar.textContent = parts.join(" · ");
+  bar.classList.remove("hidden");
+}
+
+// ── Benchmark ─────────────────────────────────────────────────────────────────
+
+async function loadBenchmarkHistory(): Promise<void> {
+  try {
+    const results: BenchmarkResult[] = await invoke("list_benchmarks");
+    benchmarkResults = results;
+    renderAllBenchmarks();
+  } catch (e) {
+    console.error("list_benchmarks failed", e);
+  }
+}
+
+function renderAllBenchmarks(): void {
+  benchmarkResultsEl.innerHTML = "";
+  if (benchmarkResults.length === 0) {
+    btnCopyResults.classList.add("hidden");
+    return;
+  }
+  const bestTps = Math.max(...benchmarkResults.map((r) => r.tokensPerSec));
+  for (const r of benchmarkResults) {
+    benchmarkResultsEl.appendChild(renderBenchmarkRow(r, r.tokensPerSec === bestTps));
+  }
+  btnCopyResults.classList.remove("hidden");
+}
+
+function renderBenchmarkRow(r: BenchmarkResult, isBest: boolean): HTMLDivElement {
+  const row = document.createElement("div");
+  row.className = "benchmark-row" + (isBest ? " bench-best" : "");
+
+  const date = new Date(r.timestamp);
+  const timeStr = date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const sizeGb = (r.modelSizeBytes / 1_000_000_000).toFixed(1);
+
+  row.innerHTML = `
+    <div class="bench-header">
+      <span class="bench-model" title="${escapeHtml(r.modelName)}">${escapeHtml(r.modelName)}</span>
+      <div class="bench-header-right">
+        <span class="bench-preset-badge">${escapeHtml(r.promptLabel)}</span>
+        <span class="bench-timestamp">${timeStr}</span>
+        <button class="bench-delete" title="Delete result">×</button>
+      </div>
+    </div>
+    <div class="bench-grid">
+      <div class="bench-metric">
+        <span class="bench-val">${r.tokensPerSec.toFixed(1)}</span>
+        <span class="bench-label">tok/s</span>
+      </div>
+      <div class="bench-metric">
+        <span class="bench-val">${r.toksPerSecPerGb.toFixed(1)}</span>
+        <span class="bench-label">tok/s/GB</span>
+      </div>
+      <div class="bench-metric">
+        <span class="bench-val">${r.ttftMs}</span>
+        <span class="bench-label">TTFT ms</span>
+      </div>
+      <div class="bench-metric">
+        <span class="bench-val">${r.tokensGenerated}</span>
+        <span class="bench-label">tokens</span>
+      </div>
+      <div class="bench-metric">
+        <span class="bench-val">${r.totalMs}</span>
+        <span class="bench-label">total ms</span>
+      </div>
+    </div>
+    <div class="bench-footer">${escapeHtml(r.backend)} · ${sizeGb} GB</div>
+  `;
+
+  row.querySelector<HTMLButtonElement>(".bench-delete")!.addEventListener("click", async () => {
+    try {
+      await invoke("delete_benchmark", { id: r.id });
+      benchmarkResults = benchmarkResults.filter((x) => x.id !== r.id);
+      renderAllBenchmarks();
+    } catch (e) {
+      console.error("delete_benchmark failed", e);
+    }
+  });
+
+  return row;
+}
+
+async function handleRunBenchmark(): Promise<void> {
+  if (isGenerating) {
+    setStatus("Cannot run benchmark while generating.");
+    return;
+  }
+
+  const customPrompt = selectedBenchmarkTokens === 0 ? benchCustomPrompt.value.trim() : undefined;
+  if (selectedBenchmarkTokens === 0 && !customPrompt) {
+    setBenchmarkStatus("Enter a custom prompt first.");
+    return;
+  }
+
+  btnRunBenchmark.disabled = true;
+  setBenchmarkStatus("Running benchmark (warm-up + timed pass)…");
+
+  try {
+    const result: BenchmarkResult = await invoke("run_benchmark", {
+      maxTokens: selectedBenchmarkTokens === 0 ? 128 : selectedBenchmarkTokens,
+      customPrompt: customPrompt ?? null,
+    });
+    benchmarkResults.unshift(result);
+    renderAllBenchmarks();
+    setBenchmarkStatus(`Done · ${result.tokensPerSec.toFixed(1)} tok/s`, 3000);
+    setStatus(`Benchmark complete: ${result.tokensPerSec.toFixed(1)} tok/s`);
+  } catch (e) {
+    setBenchmarkStatus(`Error: ${e}`);
+    setStatus("Benchmark failed.");
+  } finally {
+    btnRunBenchmark.disabled = false;
+  }
+}
+
+async function handleCopyBenchmarkResults(): Promise<void> {
+  if (benchmarkResults.length === 0) return;
+  const header = "| Model | Backend | tok/s | tok/s/GB | TTFT ms | Tokens | Total ms | Prompt |";
+  const sep    = "|---|---|---|---|---|---|---|---|";
+  const rows = benchmarkResults.map((r) =>
+    `| ${r.modelName} | ${r.backend} | ${r.tokensPerSec.toFixed(1)} | ${r.toksPerSecPerGb.toFixed(1)} | ${r.ttftMs} | ${r.tokensGenerated} | ${r.totalMs} | ${r.promptLabel} |`
+  );
+  const table = [header, sep, ...rows].join("\n");
+  try {
+    await navigator.clipboard.writeText(table);
+    setBenchmarkStatus("Copied to clipboard!", 2000);
+  } catch {
+    setBenchmarkStatus("Copy failed — clipboard unavailable.");
+  }
+}
+
+function setBenchmarkStatus(text: string, clearAfterMs?: number): void {
+  benchmarkStatus.textContent = text;
+  benchmarkStatus.classList.remove("hidden");
+  if (clearAfterMs) {
+    setTimeout(() => benchmarkStatus.classList.add("hidden"), clearAfterMs);
+  }
 }
 
 function setStatus(text: string) { statusBar.textContent = text; }

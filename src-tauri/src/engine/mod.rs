@@ -1,5 +1,8 @@
 pub mod stub;
 
+#[cfg(feature = "engine-tpt-gpu")]
+pub mod tpt_gpu_engine;
+
 #[cfg(any(feature = "engine-candle", feature = "engine-wgpu"))]
 pub mod candle_engine;
 
@@ -92,22 +95,33 @@ pub struct ModelInfo {
 pub type EngineHandle = Arc<tokio::sync::Mutex<Box<dyn LlmEngine>>>;
 
 pub fn default_engine() -> EngineHandle {
+    // Priority: tpt-gpu (when adapter available) > wgpu > candle > stub.
+    // Each branch returns early; the stub at the end is the unconditional fallback
+    // and is suppressed by `#[allow(unreachable_code)]` when a higher-priority
+    // feature always returns.
+    #[cfg(feature = "engine-tpt-gpu")]
+    if tpt_gpu_engine::TptGpuEngine::gpu_available() {
+        return Arc::new(tokio::sync::Mutex::new(
+            Box::new(tpt_gpu_engine::TptGpuEngine::new()) as Box<dyn LlmEngine>,
+        ));
+    }
+
     #[cfg(feature = "engine-wgpu")]
     {
-        Arc::new(tokio::sync::Mutex::new(
+        return Arc::new(tokio::sync::Mutex::new(
             Box::new(wgpu_engine::WgpuEngine::new()) as Box<dyn LlmEngine>,
-        ))
+        ));
     }
+
     #[cfg(all(feature = "engine-candle", not(feature = "engine-wgpu")))]
     {
-        Arc::new(tokio::sync::Mutex::new(
+        return Arc::new(tokio::sync::Mutex::new(
             Box::new(candle_engine::CandleEngine::new()) as Box<dyn LlmEngine>,
-        ))
+        ));
     }
-    #[cfg(not(any(feature = "engine-candle", feature = "engine-wgpu")))]
-    {
-        Arc::new(tokio::sync::Mutex::new(
-            Box::new(stub::StubEngine::new()) as Box<dyn LlmEngine>,
-        ))
-    }
+
+    #[allow(unreachable_code)]
+    Arc::new(tokio::sync::Mutex::new(
+        Box::new(stub::StubEngine::new()) as Box<dyn LlmEngine>,
+    ))
 }

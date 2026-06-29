@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use bytemuck::Pod;
-use wgpu::{ComputePipeline, Device};
+use wgpu::{CommandEncoder, ComputePipeline, Device};
 
 use crate::engine::wgpu_context::GpuContext;
 
@@ -176,6 +176,67 @@ pub fn readback_f32(ctx: &GpuContext, src: &wgpu::Buffer, n: usize) -> Vec<f32> 
 
     let data = slice.get_mapped_range();
     bytemuck::cast_slice::<u8, f32>(&data).to_vec()
+}
+
+/// Append a compute dispatch to an existing `CommandEncoder` without submitting.
+///
+/// Between consecutive compute passes in the same encoder the WebGPU spec
+/// guarantees that storage-buffer writes from one pass are visible to the next,
+/// so dependent operations (e.g. dequant → GEMM) can be safely batched here and
+/// submitted together via a single `queue.submit()` call.
+///
+/// All temporary GPU objects (uniform buffer, bind-group, layout handle) are
+/// dropped at the end of this function; wgpu's internal Arc-based resource
+/// tracking keeps them alive through the encoder until `queue.submit()`.
+pub fn append_dispatch(
+    encoder: &mut CommandEncoder,
+    device: &Device,
+    pipeline: &ComputePipeline,
+    bindings: &[BindingEntry<'_>],
+    uniform_data: Option<&dyn UniformBytes>,
+    dispatch_x: u32,
+    dispatch_y: u32,
+    dispatch_z: u32,
+) {
+    let uniform_buf = uniform_data.map(|u| {
+        use wgpu::util::DeviceExt;
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("uniform"),
+            contents: u.as_bytes(),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        })
+    });
+
+    let bgl = pipeline.get_bind_group_layout(0);
+    let mut entries: Vec<wgpu::BindGroupEntry> = bindings
+        .iter()
+        .map(|b| wgpu::BindGroupEntry {
+            binding: b.binding,
+            resource: b.buffer.as_entire_binding(),
+        })
+        .collect();
+    if let Some(ref ub) = uniform_buf {
+        entries.push(wgpu::BindGroupEntry {
+            binding: entries.len() as u32,
+            resource: ub.as_entire_binding(),
+        });
+    }
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bgl,
+        entries: &entries,
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(dispatch_x, dispatch_y, dispatch_z);
+    }
+    // bg, bgl, uniform_buf drop here.
+    // wgpu's Arc tracking inside the encoder keeps their GPU resources alive.
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────────
