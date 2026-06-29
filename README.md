@@ -46,7 +46,7 @@ Load a `.gguf` model and start chatting — everything runs in a single binary, 
 ### 2. Build
 
 ```bash
-git clone https://github.com/tpt-solutions/tpt-spark
+git clone https://github.com/PhillipC05/tpt-spark
 cd tpt-spark
 npm install
 
